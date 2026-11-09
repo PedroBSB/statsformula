@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+* Path models: `statsformula.sklearn.PathModel(model, estimator)` fits a system of regressions
+  written as a multi-line formula (one `response ~ predictors` R formula per line; comments,
+  continuation lines, `;`, lavaan-style `y1 + y2 ~ x`, repeated responses merged).
+  * Equation-by-equation fit with any scikit-learn estimator (or one per response); default
+    `lm`-equivalent, `GAMRegressor` for equations with smooths.
+  * `predict()` propagates predictions through the system (reduced form), or uses observed
+    predictors (`predict_mode="direct"`); `score()`, `coefficients()`,
+    `effects("direct"|"indirect"|"total")`; `clone`/`GridSearchCV`/pickle compatible.
+  * Validated against R: `lm()` per equation and propagated predictions on 8 models, and
+    `lavaan::sem()` estimates and total effects (uncorrelated disturbances) on 5 of them.
+* `parse_path_model()` / `PathEquation`.
+
 ## 0.3.0 (2026-11-09)
 
 * scikit-learn integration (`statsformula.sklearn`, `pip install statsformula[sklearn]`):

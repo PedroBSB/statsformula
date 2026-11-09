@@ -50,6 +50,8 @@ Matrix 1.7-3); the fixtures are in `tests/fixtures` and can be regenerated with
 * penalty matrices of every mgcv model (`G$S`, `G$off`, `G$rank`, smoothing-parameter names) and
   18 penalized GAM fits (`gam(method = "REML" / "GCV.Cp")`, fixed `sp`, weights, `gamma`):
   smoothing parameters, coefficients, fitted values, predictions, edf and scale;
+* 8 path models: `lm()` per equation, propagated predictions, and `lavaan::sem()` estimates and
+  total effects (`tools/make_path_fixtures.py`);
 * 132 lavaan model strings and 353 option/preset combinations compared with lavaan 0.7.3
   (`tools/make_lavaan_fixtures.py`).
 
@@ -206,6 +208,42 @@ on the log scale; when mgcv sends a smoothing parameter to infinity (a smooth re
 null space), both stop at an arbitrary large value and the fitted values agree to ~1e-5.
 Only the Gaussian family with identity link is fitted; for other models use `penalties_` with
 your own solver.
+
+### Path models (multi-line formulas)
+
+A system of regressions can be written as a multi-line formula, one R formula per line, and
+fitted as a single scikit-learn estimator:
+
+```python
+from statsformula.sklearn import PathModel
+
+model = """
+  # mediation with a transformed covariate
+  m  ~ x + f                      # mediator
+  y  ~ m + x + log(w) +
+       poly(z, 2)                 # continuation line
+  y2 + y3 ~ m                     # one equation per response (lavaan style)
+"""
+pm = PathModel(model).fit(df)                      # each equation: lm on its complete cases
+pm.predict(new)        # m, y, y2, y3; downstream equations use the *predicted* m
+pm.coefficients()      # lhs / op / rhs / est, like lavaan::parameterEstimates()
+
+pm = PathModel("m ~ x + z\ny ~ m + x").fit(df)
+pm.effects("indirect").loc["y", "x"]               # a * b, as lavaan's  ind := a*b
+pm.effects("total")                                # (I - B)^-1 B
+
+PathModel(model, estimator=Ridge())                       # same estimator for every equation
+PathModel(model, estimator={"y": RandomForestRegressor()})  # per response (others: lm)
+PathModel("m ~ x\ny ~ s(m) + s(z)")                       # smooths -> GAMRegressor (REML)
+GridSearchCV(PathModel(model, estimator=Ridge()), {"estimator__alpha": [0.1, 1, 10]})
+```
+
+`predict_mode="propagate"` (default) takes only exogenous variables from the data and feeds each
+equation's prediction into the equations downstream (needs a recursive model);
+`predict_mode="direct"` uses the observed predictors. With linear equations the fit equals
+`lavaan::sem()` with observed variables and uncorrelated disturbances
+(`auto.cov.y = FALSE`). Latent variables (`=~`) and covariances (`~~`) are not fitted; parse
+those models with `lavaanify()`.
 
 ### lavaan model syntax (structural equation models)
 
