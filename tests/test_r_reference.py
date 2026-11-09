@@ -167,6 +167,11 @@ def _run(cs, k):
     if k == "gam":
         import test_mgcv_helpers
         return test_mgcv_helpers.run_gam_case(cs, DATA)
+    if k == "lm":
+        from sklearn.linear_model import LinearRegression
+        from statsformula.sklearn import FormulaEstimator
+        d = DATA[cs["data"]]
+        return FormulaEstimator(cs["formula"], LinearRegression(fit_intercept=False)).fit(d), d
     if k == "gampen":
         import test_mgcv_helpers
         return test_mgcv_helpers.run_gampen_case(cs, DATA)
@@ -253,6 +258,18 @@ def test_against_r(case):
     elif k == "gam":
         import test_mgcv_helpers
         test_mgcv_helpers.check_gam_case(res, r, cs)
+    elif k == "lm":
+        est, d = res
+        coef = np.atleast_2d(est.estimator_.coef_)  # (n_responses, n_features)
+        R = np.column_stack([num(c) for c in r["coef"]]).T
+        assert est.design_columns_ == r["rownames"]
+        np.testing.assert_allclose(coef, R, rtol=1e-7, atol=1e-9)
+        from statsformula.sklearn import design_matrices
+        _, Xd = design_matrices(cs["formula"], d)
+        fitted = np.column_stack([np.asarray(est.predict(d.loc[Xd.index]))]) if est.predict(d.head(1)).ndim == 1 \
+            else np.asarray(est.predict(d.loc[Xd.index]))
+        Rf = np.column_stack([num(c) for c in r["fitted"]])
+        np.testing.assert_allclose(fitted, Rf, rtol=1e-7, atol=1e-9)
     elif k == "gampen":
         import test_mgcv_helpers
         test_mgcv_helpers.check_gampen_case(res, r, cs)

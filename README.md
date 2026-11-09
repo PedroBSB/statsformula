@@ -135,6 +135,43 @@ X_test = X.model_spec.get_model_matrix(test)        # same transformation, level
 S = sf.sparse_model_matrix("~ user * item", big_df)  # scipy.sparse
 ```
 
+### scikit-learn pipelines
+
+`pip install statsformula[sklearn]`
+
+```python
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge, LogisticRegression
+from sklearn.model_selection import GridSearchCV
+from statsformula.sklearn import FormulaTransformer, FormulaEstimator, design_matrices
+
+# 1. the formula as a transformer step (X only)
+pipe = make_pipeline(FormulaTransformer("~ log(x) + ns(z, 3) + C(g, sum)", remove_intercept=True),
+                     StandardScaler(), Ridge())
+pipe.fit(train, train["y"]).predict(test)
+
+# 2. the formula builds Y *and* X; Y can have several columns
+model = FormulaEstimator("cbind(y1, y2) ~ log(x) + poly(z, 2) + g", Ridge())
+model.fit(train).predict(test)                  # (n, 2) predictions
+FormulaEstimator("cls ~ x + g", LogisticRegression()).fit(train).predict_proba(test)
+
+# hyper-parameters *and* formulas can be tuned
+GridSearchCV(model, {"formula": ["cbind(y1, y2) ~ x + g", "cbind(y1, y2) ~ log(x) * g"],
+                     "estimator__alpha": [0.1, 1, 10]}, cv=5).fit(train)
+
+Y, X = design_matrices("y1 | y2 ~ log(x) + g", train)   # aligned response and design matrices
+```
+
+A scikit-learn `Pipeline` step can only transform `X`, so building the response from the
+formula needs the `FormulaEstimator` wrapper. All data-dependent transformations (factor
+levels, contrasts, `poly`, `ns`, `bs`, `scale`, mgcv smooths) are learned on `fit` and reused on
+`predict`/`transform`. Responses: `y`, transformed `log(y)`, `cbind(y1, y2, ...)`, multi-part
+`y1 | y2 ~ ...`; categorical responses as labels (for classifiers), integer codes or one-hot
+(`y_encoding=`). Rows with missing values are dropped jointly from `Y`, `X` and `sample_weight`
+when fitting; `transform` keeps every row (`na_action="na.pass"`). Custom Python functions used
+inside the formula are passed with `env={"name": func}`.
+
 ### lavaan model syntax (structural equation models)
 
 `sf.lavaan_parse()` is a port of `lavaan::lavParseModelString(model, as.data.frame. = TRUE)`

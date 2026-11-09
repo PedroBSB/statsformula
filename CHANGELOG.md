@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+* scikit-learn integration (`statsformula.sklearn`, `pip install statsformula[sklearn]`):
+  * `FormulaTransformer`: a formula's design matrix as a pipeline step (stateful: factor levels,
+    contrasts, `poly`/`ns`/`bs`/`scale`, mgcv smooths learned on `fit`); pandas, numpy or sparse output;
+    works with `Pipeline`, `ColumnTransformer` and `set_output`.
+  * `FormulaEstimator(formula, estimator)`: builds both `Y` (`y`, `log(y)`, `cbind(y1, y2)`,
+    `y1 | y2 ~ ...`, categorical responses) and `X` from the formula and fits any estimator or
+    pipeline; compatible with `clone`, `GridSearchCV` (including searching over formulas),
+    `cross_val_score`, sample weights and pickling.
+  * `design_matrices(formula, data)`: aligned `(Y, X)` with multi-column responses.
+* Linear-model coefficients of `FormulaEstimator(..., LinearRegression(fit_intercept=False))`
+  validated against R's `lm()` (including multi-response `mlm` fits).
+
 ## 0.2.0 (2026-11-09)
 
 * lavaan model syntax: `lavaan_parse()` (port of `lavParseModelString()`), `lavaanify()`

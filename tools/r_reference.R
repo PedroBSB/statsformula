@@ -159,6 +159,12 @@ run_case <- function(cs) {
     w <- model.weights(mf); res$weights <- if (is.null(w)) NULL else as.list(w)
     return(res)
   }
+  if (k == "lm") {
+    fit <- lm(as.formula(cs$formula), data = getd(cs$data))
+    cf <- as.matrix(coef(fit))
+    return(list(coef = lapply(seq_len(ncol(cf)), function(j) as.list(unname(cf[, j]))),
+                rownames = as.list(rownames(cf)), fitted = lapply(seq_len(NCOL(fitted(fit))), function(j) as.list(unname(as.matrix(fitted(fit))[, j])))))
+  }
   if (k == "gam") return(gam_case(cs))
   if (k == "gampen") return(list(smooths = gampen_case(cs)))
   stop("unknown case kind ", k)

@@ -284,3 +284,9 @@ for sm in ["s(x)", "s(x, k = 6)", "s(x, bs = \"ts\")", "s(x, z)", "s(x, z, k = 1
            "s(x, bs = \"bs\", m = c(4, 2))", "te(x, z, bs = \"bs\")"]:
     GAM.append({"kind": "gampen", "smooth": sm, "data": "d1"})
 ALL_CASES = ALL_CASES + GAM
+
+LM = [{"kind": "lm", "formula": f, "data": "d2"} for f in [
+    "y ~ log(x) + f", "cbind(y, y2) ~ x * g + poly(z, 2)", "cbind(y, y2, w) ~ C(f, sum) + ns(x, 3) + l",
+    "log(w) ~ f + g:x + o", "cbind(y, y2) ~ h + bs(x, df = 4) - 1",
+]]
+ALL_CASES = ALL_CASES + LM
