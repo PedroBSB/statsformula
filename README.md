@@ -47,6 +47,9 @@ Matrix 1.7-3); the fixtures are in `tests/fixtures` and can be regenerated with
 * 500 randomly generated formulas compared with R's `terms()` (2,000 more checked during
   development);
 * 400 randomly generated formulas compared with R's `model.matrix()`;
+* penalty matrices of every mgcv model (`G$S`, `G$off`, `G$rank`, smoothing-parameter names) and
+  18 penalized GAM fits (`gam(method = "REML" / "GCV.Cp")`, fixed `sp`, weights, `gamma`):
+  smoothing parameters, coefficients, fitted values, predictions, edf and scale;
 * 132 lavaan model strings and 353 option/preset combinations compared with lavaan 0.7.3
   (`tools/make_lavaan_fixtures.py`).
 
@@ -135,6 +138,75 @@ X_test = X.model_spec.get_model_matrix(test)        # same transformation, level
 S = sf.sparse_model_matrix("~ user * item", big_df)  # scipy.sparse
 ```
 
+### scikit-learn pipelines
+
+`pip install statsformula[sklearn]`
+
+```python
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge, LogisticRegression
+from sklearn.model_selection import GridSearchCV
+from statsformula.sklearn import FormulaTransformer, FormulaEstimator, design_matrices
+
+# 1. the formula as a transformer step (X only)
+pipe = make_pipeline(FormulaTransformer("~ log(x) + ns(z, 3) + C(g, sum)", remove_intercept=True),
+                     StandardScaler(), Ridge())
+pipe.fit(train, train["y"]).predict(test)
+
+# 2. the formula builds Y *and* X; Y can have several columns
+model = FormulaEstimator("cbind(y1, y2) ~ log(x) + poly(z, 2) + g", Ridge())
+model.fit(train).predict(test)                  # (n, 2) predictions
+FormulaEstimator("cls ~ x + g", LogisticRegression()).fit(train).predict_proba(test)
+
+# hyper-parameters *and* formulas can be tuned
+GridSearchCV(model, {"formula": ["cbind(y1, y2) ~ x + g", "cbind(y1, y2) ~ log(x) * g"],
+                     "estimator__alpha": [0.1, 1, 10]}, cv=5).fit(train)
+
+Y, X = design_matrices("y1 | y2 ~ log(x) + g", train)   # aligned response and design matrices
+```
+
+A scikit-learn `Pipeline` step can only transform `X`, so building the response from the
+formula needs the `FormulaEstimator` wrapper. All data-dependent transformations (factor
+levels, contrasts, `poly`, `ns`, `bs`, `scale`, mgcv smooths) are learned on `fit` and reused on
+`predict`/`transform`. Responses: `y`, transformed `log(y)`, `cbind(y1, y2, ...)`, multi-part
+`y1 | y2 ~ ...`; categorical responses as labels (for classifiers), integer codes or one-hot
+(`y_encoding=`). Rows with missing values are dropped jointly from `Y`, `X` and `sample_weight`
+when fitting; `transform` keeps every row (`na_action="na.pass"`). Custom Python functions used
+inside the formula are passed with `env={"name": func}`.
+
+### Smoothing penalties and penalized GAMs (mgcv)
+
+Every mgcv design matrix carries its wiggliness penalties, exactly as `gam(..., fit = FALSE)`
+returns them (`G$S`, `G$off`, `G$rank`, names of `G$sp`), so you can regularize the smooths
+yourself or let statsformula estimate the smoothing parameters like `mgcv::gam`:
+
+```python
+import statsformula as sf
+from statsformula.sklearn import FormulaTransformer, GAMRegressor
+
+X = sf.model_matrix("y ~ g + s(x) + te(x, z)", df)
+X.model_spec.penalties        # [<GamPenalty s(x): 9x9 at column 2, rank 8>, te(x,z)1, te(x,z)2]
+P = sf.penalty_matrix(X.model_spec.penalties, X.shape[1], sp=[0.5, 1.0, 2.0])  # sum_j sp_j S_j
+beta = np.linalg.solve(X.T @ X + P, X.T @ y)                                    # generalized ridge
+
+b = sf.gam("y ~ g + s(x) + te(x, z)", df, method="REML")   # or "GCV.Cp"; sp=[...] to fix them
+b.sp, b.coefficients, b.edf.sum(), b.scale, b.predict(new)  # same numbers as mgcv
+
+tr = FormulaTransformer("~ g + s(x) + s(z)").fit(df)        # in a pipeline
+tr.penalties_, tr.penalty_matrix(sp=[1.0, 3.0])             # aligned with tr.transform() columns
+
+GAMRegressor("cbind(y1, y2) ~ g + s(x) + te(x, z)", method="REML").fit(df).predict(new)
+GridSearchCV(GAMRegressor("y ~ s(x) + s(z)"), {"sp": [[0.1, 0.1], [1, 1], [10, 10]]})
+```
+
+The penalized fit minimizes `||y - X b||^2_W + sum_j sp_j b' S_j b`. Smoothing parameters are
+estimated by REML (scale profiled out) or GCV with exact gradients, and match mgcv's to ~1e-3
+on the log scale; when mgcv sends a smoothing parameter to infinity (a smooth reduced to its
+null space), both stop at an arbitrary large value and the fitted values agree to ~1e-5.
+Only the Gaussian family with identity link is fitted; for other models use `penalties_` with
+your own solver.
+
 ### lavaan model syntax (structural equation models)
 
 `sf.lavaan_parse()` is a port of `lavaan::lavParseModelString(model, as.data.frame. = TRUE)`
@@ -205,7 +277,9 @@ R built with ICU). Use `sf.set_collation("C")` to mimic `LC_COLLATE=C`. Unlike R
   are not affected.
 * mgcv bases not yet available: `t2`, `fs`, `gp`, `ds`, `so`, `mrf`, `ad`, `sos`, `sz`, `re`
   inside tensor products, smooths with matrix (summation convention) arguments; `id=` and `sp=`
-  are accepted but ignored (they only matter when fitting).
+  inside `s()` are accepted but ignored (pass `sp=` to `gam()`/`GAMRegressor` instead).
+* `gam()`/`GAMRegressor` fit Gaussian identity-link models only (no `family=`, `select=`,
+  `paraPen=`); offsets are subtracted when fitting but not added by `predict()`.
 * R syntax that is not formula-related (`function`, `if`, assignment) is not supported inside
   formulas.
 * By default, R's functions take precedence over Python objects of the same name (for example a

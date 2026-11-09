@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "GPL-2.0-or-later"
 license-files = ["LICENSE"]
 authors = [{ name = "Pedro Albuquerque", email = "pedro.melo.albuquerque@gmail.com" }]
-keywords = ["formula", "R", "model matrix", "design matrix", "statistics", "regression", "mgcv", "gam", "splines", "patsy", "formulaic", "statsmodels"]
+keywords = ["formula", "R", "model matrix", "design matrix", "statistics", "regression", "mgcv", "gam", "splines", "patsy", "formulaic", "statsmodels", "scikit-learn", "lavaan", "sem"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
@@ -30,7 +30,8 @@ classifiers = [
 dependencies = ["numpy>=1.22", "pandas>=1.4", "scipy>=1.8"]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "scikit-learn>=1.6"]
+sklearn = ["scikit-learn>=1.6"]
 statsmodels = ["statsmodels>=0.13"]
 
 [project.urls]
