@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-11-09)
 
 * scikit-learn integration (`statsformula.sklearn`, `pip install statsformula[sklearn]`):
   * `FormulaTransformer`: a formula's design matrix as a pipeline step (stateful: factor levels,
