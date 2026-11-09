@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-11-09)
 
 * Path models: `statsformula.sklearn.PathModel(model, estimator)` fits a system of regressions
   written as a multi-line formula (one `response ~ predictors` R formula per line; comments,
