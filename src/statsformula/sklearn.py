@@ -36,7 +36,7 @@ from ._formula import Formula, RFormula, coerce_formula
 from ._model import ModelFrame
 from ._rtypes import Character, Factor, Logical, RError, RMatrix, as_factor
 
-__all__ = ["FormulaTransformer", "FormulaEstimator", "GAMRegressor", "design_matrices", "response_matrix"]
+__all__ = ["FormulaTransformer", "FormulaEstimator", "GAMRegressor", "PathModel", "design_matrices", "response_matrix"]
 
 _Y_ENCODINGS = ("auto", "numeric", "onehot", "codes", "labels")
 
@@ -582,3 +582,219 @@ class GAMRegressor(RegressorMixin, BaseEstimator):
     def get_feature_names_out(self, input_features=None):
         check_is_fitted(self, "design_columns_")
         return np.asarray(self.design_columns_, dtype=object)
+
+
+# ---------------------------------------------------------------------------
+# Path models (systems of regression equations)
+# ---------------------------------------------------------------------------
+
+class PathModel(BaseEstimator):
+    """A system of regressions written as a multi-line formula, fitted equation by equation.
+
+    >>> model = '''
+    ...   m ~ x + z            # mediator
+    ...   y ~ m + x + log(w)   # outcome
+    ... '''
+    >>> pm = PathModel(model).fit(df)                        # doctest: +SKIP
+    >>> pm.predict(new)            # m and y; y uses the *predicted* m   # doctest: +SKIP
+    >>> pm.effects("indirect")     # x -> m -> y, as lavaan's a*b        # doctest: +SKIP
+
+    Each line is an R formula (see :mod:`statsformula._path` for the syntax:
+    comments, continuation lines, ``y1 + y2 ~ x`` and ``cbind(y1, y2) ~ x``
+    give one equation per response, repeated responses are merged).  Each
+    equation is fitted on its own complete cases with a clone of
+    ``estimator``.  With linear estimators this is the maximum likelihood fit of
+    a recursive path model with uncorrelated disturbances (``lavaan::sem()``
+    with observed variables).
+
+    Parameters
+    ----------
+    model : str
+        Multi-line model: one ``response ~ predictors`` formula per line.
+    estimator : estimator or dict, optional
+        Estimator cloned for every equation, or ``{response: estimator}``
+        (responses missing from the dict use ``LinearRegression``).  Default:
+        ``LinearRegression(fit_intercept=False)`` on the formula's design matrix
+        (which has the intercept), or :class:`GAMRegressor` for equations with
+        ``s()``/``te()``/``ti()`` smooths.
+    predict_mode : {"propagate", "direct"}
+        ``"propagate"`` (default): only exogenous variables are taken from the
+        data; endogenous predictors are replaced by their predictions, upstream
+        first (the reduced form; needs a recursive model).  ``"direct"``: every
+        equation uses the observed values of its predictors.
+    gam_method : {"REML", "GCV.Cp"}
+        Smoothing-parameter method of the default GAM equations.
+    contrasts, na_action, env : see :class:`FormulaEstimator`.
+
+    Attributes
+    ----------
+    equations_ : list of :class:`PathEquation`
+    estimators_ : dict response -> fitted per-equation estimator
+    endogenous_, exogenous_ : variable names
+    order_ : responses in causal (topological) order, or None if non-recursive
+    """
+
+    def __init__(self, model: str = "y ~ x", estimator=None, predict_mode: str = "propagate",
+                 gam_method: str = "REML", contrasts: Optional[dict] = None, na_action: str = "na.omit",
+                 env: Optional[dict] = None):
+        self.model = model
+        self.estimator = estimator
+        self.predict_mode = predict_mode
+        self.gam_method = gam_method
+        self.contrasts = contrasts
+        self.na_action = na_action
+        self.env = env
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.estimator_type = "regressor"
+        tags.target_tags.required = False
+        tags.target_tags.multi_output = True
+        tags.input_tags.string = True
+        tags.input_tags.categorical = True
+        tags.input_tags.allow_nan = True
+        return tags
+
+    def _estimator_for(self, eq):
+        from sklearn.linear_model import LinearRegression
+        from ._mgcv import has_smooths
+        env = {} if self.env is None else self.env
+        est = self.estimator.get(eq.response) if isinstance(self.estimator, dict) else self.estimator
+        if est is None and has_smooths(coerce_formula(eq.formula, env)):
+            return GAMRegressor(eq.formula, method=self.gam_method, na_action=self.na_action, env=self.env)
+        if est is None:
+            est = LinearRegression(fit_intercept=False)
+        return FormulaEstimator(eq.formula, clone(est), y_encoding="auto", contrasts=self.contrasts,
+                                na_action=self.na_action, env=self.env)
+
+    def fit(self, X, y=None, **fit_params):
+        from ._parser import all_vars, parse
+        from ._path import parse_path_model, path_order
+        if self.predict_mode not in ("propagate", "direct"):
+            raise ValueError("predict_mode must be 'propagate' or 'direct'")
+        data = _as_frame(X).reset_index(drop=True)
+        eqs = parse_path_model(self.model)
+        self.equations_ = eqs
+        self.estimators_ = {}
+        for eq in eqs:
+            self.estimators_[eq.response] = self._estimator_for(eq).fit(data, **fit_params)
+        self.endogenous_ = [eq.response for eq in eqs]
+        lhs_vars = {v for eq in eqs for v in all_vars(parse(eq.lhs))}
+        seen = []
+        for eq in eqs:
+            for v in eq.predictors:
+                if v not in lhs_vars and v not in seen:
+                    seen.append(v)
+        self.exogenous_ = seen
+        order = path_order(eqs)
+        self.order_ = None if order is None else [eqs[i].response for i in order]
+        self.n_features_in_ = data.shape[1]
+        self.feature_names_in_ = np.asarray([str(c) for c in data.columns], dtype=object)
+        return self
+
+    def predict(self, X) -> pd.DataFrame:
+        """Predictions of every endogenous variable (one column per equation)."""
+        from ._parser import Sym, all_vars, parse
+        check_is_fitted(self, "estimators_")
+        data = _as_frame(X).reset_index(drop=True)
+        out = {}
+        if self.predict_mode == "direct":
+            for eq in self.equations_:
+                out[eq.response] = np.asarray(self.estimators_[eq.response].predict(data)).ravel()
+        else:
+            if self.order_ is None:
+                raise RError("the path model is non-recursive (it has feedback loops); "
+                             "use predict_mode='direct'")
+            data = data.copy()
+            plain = {eq.response: isinstance(parse(eq.lhs), Sym) for eq in self.equations_}
+            transformed = {v: eq.lhs for eq in self.equations_ if not plain[eq.response]
+                           for v in all_vars(parse(eq.lhs))}
+            by_resp = {eq.response: eq for eq in self.equations_}
+            for resp in self.order_:
+                eq = by_resp[resp]
+                bad = [v for v in eq.predictors if v in transformed]
+                if bad:
+                    raise RError("cannot propagate through the transformed response %s (used by %s); "
+                                 "use a plain response or predict_mode='direct'" % (transformed[bad[0]], eq.formula))
+                pred = np.asarray(self.estimators_[resp].predict(data)).ravel()
+                out[resp] = pred
+                if plain[resp]:
+                    data[resp] = pred
+        return pd.DataFrame({eq.response: out[eq.response] for eq in self.equations_})
+
+    def score(self, X, y=None, sample_weight=None):
+        """Mean R^2 over the equations (predictions follow ``predict_mode``)."""
+        from sklearn.metrics import r2_score
+        data = _as_frame(X).reset_index(drop=True)
+        P = self.predict(data)
+        scores = []
+        env = {} if self.env is None else self.env
+        for eq in self.equations_:
+            f = coerce_formula(eq.formula, env)
+            mf = _response_model_frame(f, data, "na.pass", env)
+            yv = response_matrix(mf, f, "numeric").iloc[:, 0].to_numpy(dtype=float)
+            pv = P[eq.response].to_numpy(dtype=float)
+            ok = ~(np.isnan(yv) | np.isnan(pv))
+            w = None if sample_weight is None else np.asarray(sample_weight)[ok]
+            scores.append(r2_score(yv[ok], pv[ok], sample_weight=w))
+        return float(np.mean(scores))
+
+    # -- linear path coefficients and effects ----------------------------------
+    def _linear_coefs(self):
+        coefs = {}
+        for eq in self.equations_:
+            est = self.estimators_[eq.response]
+            if isinstance(est, GAMRegressor):
+                cols, coef, icpt = est.design_columns_, np.asarray(est.coef_), 0.0
+            else:
+                inner = est.estimator_
+                if not hasattr(inner, "coef_"):
+                    raise RError("effects need linear estimators (equation %s)" % eq.formula)
+                cols, coef = est.design_columns_, np.ravel(inner.coef_)
+                icpt = float(np.sum(np.ravel(getattr(inner, "intercept_", 0.0))))
+            d = {}
+            for c, b in zip(cols, coef):
+                d[c] = d.get(c, 0.0) + float(b)
+            if icpt:
+                d["(Intercept)"] = d.get("(Intercept)", 0.0) + icpt
+            coefs[eq.response] = d
+        return coefs
+
+    def coefficients(self) -> pd.DataFrame:
+        """Coefficients in long form: ``lhs``, ``op`` (``"~"`` or ``"~1"``), ``rhs``, ``est``
+        (like the regression rows of ``lavaan::parameterEstimates()``)."""
+        check_is_fitted(self, "estimators_")
+        rows = []
+        for resp, d in self._linear_coefs().items():
+            for c, b in d.items():
+                rows.append((resp, "~1", "", b) if c == "(Intercept)" else (resp, "~", c, b))
+        return pd.DataFrame(rows, columns=["lhs", "op", "rhs", "est"])
+
+    def effects(self, kind: str = "total") -> pd.DataFrame:
+        """Direct, indirect or total effects (rows: endogenous, columns: all predictors).
+
+        Needs linear equations whose design columns are the variables themselves
+        (``y ~ m + x``); then with ``B`` the direct effects, total effects are
+        ``(I - B_yy)^-1 B`` and indirect = total - direct, as in lavaan."""
+        check_is_fitted(self, "estimators_")
+        if kind not in ("total", "direct", "indirect"):
+            raise ValueError("kind must be 'total', 'direct' or 'indirect'")
+        coefs = self._linear_coefs()
+        endo = self.endogenous_
+        cols = list(endo) + [v for v in self.exogenous_ if v not in endo]
+        D = np.zeros((len(endo), len(cols)))
+        for i, resp in enumerate(endo):
+            for c, b in coefs[resp].items():
+                if c == "(Intercept)":
+                    continue
+                if c not in cols:
+                    raise RError("effects() needs every design column to be a variable of the model; "
+                                 "%r (equation for %s) is not" % (c, resp))
+                D[i, cols.index(c)] = b
+        if kind == "direct":
+            M = D
+        else:
+            Byy = D[:, :len(endo)]
+            T = np.linalg.solve(np.eye(len(endo)) - Byy, D)
+            M = T if kind == "total" else T - D
+        return pd.DataFrame(M, index=endo, columns=cols)

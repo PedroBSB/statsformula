@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0 (2026-11-09)
+
+* Path models: `statsformula.sklearn.PathModel(model, estimator)` fits a system of regressions
+  written as a multi-line formula (one `response ~ predictors` R formula per line; comments,
+  continuation lines, `;`, lavaan-style `y1 + y2 ~ x`, repeated responses merged).
+  * Equation-by-equation fit with any scikit-learn estimator (or one per response); default
+    `lm`-equivalent, `GAMRegressor` for equations with smooths.
+  * `predict()` propagates predictions through the system (reduced form), or uses observed
+    predictors (`predict_mode="direct"`); `score()`, `coefficients()`,
+    `effects("direct"|"indirect"|"total")`; `clone`/`GridSearchCV`/pickle compatible.
+  * Validated against R: `lm()` per equation and propagated predictions on 8 models, and
+    `lavaan::sem()` estimates and total effects (uncorrelated disturbances) on 5 of them.
+* `parse_path_model()` / `PathEquation`.
+* SEM backends (`statsformula.sem`): `sem_data()` rewrites R-expression terms of a lavaan model
+  into columns (stateful `transform()`); `fit_semopy()` / `to_semopy()`, `fit_pysem()` /
+  `to_pysem()` (twoertwein/pySEM, LISREL translation, L-BFGS fit) and `fit_pysemforge()` /
+  `to_pysemforge()` fit lavaan's full model and return lavaan-style estimates with `:=`
+  parameters. Validated against lavaan 0.7.3 on 7 models. Works around a semopy 2.3 infinite
+  loop for factors without a fixed loading; warns about pysemforge 0.1.0's random refit and
+  zeroed fit indices. New extra: `statsformula[sem]` (semopy).
+
 ## 0.3.0 (2026-11-09)
 
 * scikit-learn integration (`statsformula.sklearn`, `pip install statsformula[sklearn]`):

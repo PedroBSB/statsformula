@@ -30,9 +30,10 @@ classifiers = [
 dependencies = ["numpy>=1.22", "pandas>=1.4", "scipy>=1.8"]
 
 [project.optional-dependencies]
-test = ["pytest>=7", "scikit-learn>=1.6"]
+test = ["pytest>=7", "scikit-learn>=1.6", "semopy>=2.3"]
 sklearn = ["scikit-learn>=1.6"]
 statsmodels = ["statsmodels>=0.13"]
+sem = ["semopy>=2.3"]
 
 [project.urls]
 Homepage = "https://github.com/PedroBSB/statsformula"
