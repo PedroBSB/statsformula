@@ -149,6 +149,24 @@ def _initial_rho(prob):
     return rho
 
 
+def _check_identifiable(prob):
+    """Warn when the penalized design [X; total penalty] is rank deficient (mgcv then
+    sets the unidentifiable coefficients to zero, e.g. ``y ~ x + s(x)``)."""
+    P = np.zeros((prob.p, prob.p))
+    for pen in prob.pens:
+        P[pen.columns, pen.columns] += pen.S / max(np.linalg.norm(pen.S), 1e-300)
+    xs = max(np.linalg.norm(prob.XtX), 1e-300)
+    H = prob.XtX / xs + P
+    ev = np.linalg.eigvalsh((H + H.T) / 2)
+    r = int(np.sum(ev > ev.max() * 1e-11))
+    if r < prob.p:
+        import warnings
+        warnings.warn("the model is not identifiable: the penalized design has rank %d < %d coefficients "
+                      "(e.g. a parametric term duplicated by a smooth, as in y ~ x + s(x)); "
+                      "standard errors are meaningless and mgcv would set %d coefficient(s) to zero"
+                      % (r, prob.p, prob.p - r), RuntimeWarning, stacklevel=3)
+
+
 def fit_penalized(X, y, penalties, method: str = "REML", sp=None, weights=None, gamma: float = 1.0,
                   sp_names: Optional[Sequence[str]] = None) -> PenalizedFit:
     """Fit ``y ~ X`` by penalized least squares with mgcv's penalties.
@@ -164,6 +182,7 @@ def fit_penalized(X, y, penalties, method: str = "REML", sp=None, weights=None, 
         raise ValueError("method must be 'REML' or 'GCV.Cp'")
     method = "GCV.Cp" if method == "GCV" else method
     prob = _Problem(X, y, list(penalties), w, gamma)
+    _check_identifiable(prob)
     m = len(prob.pens)
     names = list(sp_names) if sp_names is not None else [p.name for p in prob.pens]
     if sp is None:
@@ -235,6 +254,7 @@ class GamFit:
         self.Vp = fit.Vp
         self.criterion = fit.criterion
         self.converged = fit.converged
+        self.weights = None  # prior weights (set by gam())
         self._fit = fit
 
     def penalty_matrix(self, sp=None):
@@ -242,19 +262,90 @@ class GamFit:
         from ._mgcv import penalty_matrix
         return penalty_matrix(self.penalties, self.model_matrix.shape[1], self.sp.to_numpy() if sp is None else sp)
 
-    def predict(self, newdata=None, type: str = "response"):
-        """Predictions (``type="response"``/``"link"``) or the ``"lpmatrix"`` for new data."""
+    @property
+    def residual_df(self) -> float:
+        """Residual degrees of freedom ``n - sum(edf)`` (as in ``summary.gam``)."""
+        return float(len(self.fitted_values) - self.edf.sum())
+
+    def predict(self, newdata=None, type: str = "response", se_fit: bool = False):
+        """Predictions (``type="response"``/``"link"``) or the ``"lpmatrix"`` for new data.
+
+        ``se_fit=True`` returns a DataFrame with columns ``fit`` and ``se_fit``, the
+        standard errors ``sqrt(diag(Xp Vp Xp'))`` of ``predict.gam(se.fit = TRUE)``
+        (Bayesian posterior covariance; identical for both types with the Gaussian
+        identity link).
+        """
         import pandas as pd
+        if type not in ("response", "link", "lpmatrix"):
+            raise ValueError("type must be 'response', 'link' or 'lpmatrix'")
         if newdata is None:
             Xn = self.model_matrix
         else:
             Xn = self.model_matrix.model_spec.get_model_matrix(newdata)
         if type == "lpmatrix":
             return Xn
-        return pd.Series(Xn.to_numpy() @ self.coefficients.to_numpy(), index=Xn.index)
+        A = Xn.to_numpy()
+        fit = pd.Series(A @ self.coefficients.to_numpy(), index=Xn.index)
+        if not se_fit:
+            return fit
+        se = np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", A, self.Vp, A), 0.0))
+        return pd.DataFrame({"fit": fit, "se_fit": se}, index=Xn.index)
+
+    def summary(self) -> "GamSummary":
+        """Parametric coefficient table of ``summary.gam``: estimate, standard error
+        (``sqrt(diag(Vp))``), t value and two-sided p-value on ``residual_df`` degrees
+        of freedom."""
+        return GamSummary(self)
 
     def __repr__(self):
         return "<GamFit %s %s: edf=%.3f scale=%.4g>" % (self.formula, self.method, self.edf.sum(), self.scale)
+
+
+class GamSummary:
+    """``summary(gam_fit)``: ``p_table`` (parametric terms) and the fit statistics.
+
+    The smooth-term tests of mgcv (``s.table``) are not computed; ``edf`` lists the
+    effective degrees of freedom of each smooth instead.
+    """
+
+    def __init__(self, fit: GamFit):
+        import pandas as pd
+        from scipy import stats
+        spec = fit.model_matrix.model_spec
+        k = spec.nsdf
+        est = fit.coefficients.to_numpy()[:k]
+        se = np.sqrt(np.diag(fit.Vp)[:k])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = est / se
+        df = fit.residual_df
+        p = 2.0 * stats.t.sf(np.abs(t), df)
+        self.p_table = pd.DataFrame({"Estimate": est, "Std. Error": se, "t value": t, "Pr(>|t|)": p},
+                                    index=list(fit.coefficients.index[:k]))
+        edf, start = {}, k
+        for sm in spec.smooths:
+            m = sm.X.shape[1]
+            edf[sm.label] = float(fit.edf.iloc[start:start + m].sum())
+            start += m
+        self.edf = pd.Series(edf, dtype=float)
+        self.residual_df = df
+        self.scale = fit.scale
+        self.n = len(fit.fitted_values)
+        y, mu = fit.y.to_numpy(dtype=float), fit.fitted_values.to_numpy(dtype=float)
+        w = np.ones_like(y) if fit.weights is None else np.sqrt(np.asarray(fit.weights, dtype=float))
+        ybar = np.sum(w * w * y) / np.sum(w * w)
+        self.r_sq = float(1.0 - np.var(w * (y - mu), ddof=1) * (self.n - 1)
+                          / (np.var(w * (y - ybar), ddof=1) * df))
+        self.method = fit.method
+        self.criterion = fit.criterion
+        self.formula = fit.formula
+
+    def __repr__(self):
+        lines = ["Formula: %s" % self.formula, "", "Parametric coefficients:", self.p_table.to_string(), ""]
+        if len(self.edf):
+            lines += ["Approximate edf of smooth terms:", self.edf.to_string(), ""]
+        lines.append("R-sq.(adj) = %.4g   %s = %.6g   Scale est. = %.6g   n = %d"
+                     % (self.r_sq, self.method, self.criterion, self.scale, self.n))
+        return "\n".join(lines)
 
 
 def gam(formula, data, method: str = "REML", sp=None, weights=None, gamma: float = 1.0, knots=None,
@@ -290,6 +381,7 @@ def gam(formula, data, method: str = "REML", sp=None, weights=None, gamma: float
     fit = fit_penalized(X.to_numpy(), yfit.to_numpy(), X.model_spec.penalties, method=method, sp=sp,
                         weights=w, gamma=gamma)
     res = GamFit(str(f), X, y, fit, method)
+    res.weights = w
     if o is not None:
         res.fitted_values = res.fitted_values + np.asarray(o, dtype=float)
         res.residuals = res.y - res.fitted_values

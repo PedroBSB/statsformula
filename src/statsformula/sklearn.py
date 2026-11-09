@@ -547,8 +547,16 @@ class GAMRegressor(RegressorMixin, BaseEstimator):
         M = _spec_transform(self.model_spec_, _as_frame(X), "na.pass")
         return M.to_numpy() if isinstance(M, pd.DataFrame) else np.asarray(M)
 
-    def predict(self, X):
-        return self._design(X) @ np.asarray(self.coef_).T
+    def predict(self, X, return_std: bool = False):
+        """Predictions; ``return_std=True`` also returns their standard errors
+        (``predict.gam(se.fit = TRUE)``, from the Bayesian covariance ``Vp``)."""
+        A = self._design(X)
+        pred = A @ np.asarray(self.coef_).T
+        if not return_std:
+            return pred
+        se = np.column_stack([np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", A, ft.Vp, A), 0.0))
+                              for ft in self.fits_])
+        return pred, (se[:, 0] if np.ndim(pred) == 1 else se)
 
     def transform(self, X):
         """The (lpmatrix) design matrix for new data."""

@@ -128,3 +128,17 @@ def check_gamfit_case(res, r, cs):
     np.testing.assert_allclose(b.edf.sum(), r["edf"], rtol=10 * tol)
     np.testing.assert_allclose(b.scale, r["scale"], rtol=tol)
     np.testing.assert_allclose(b.coefficients.to_numpy(), num(r["coef"]), rtol=1e-3, atol=10 * tol * yscale)
+    # standard errors (Vp) and the parametric table of summary.gam
+    se_tol = 5e-3 if '"cs"' in cs["formula"] else 50 * tol
+    pr = b.predict(newdata, se_fit=True)
+    np.testing.assert_allclose(pr["fit"].to_numpy(), num(r["pred"]), atol=tol * yscale, err_msg=str(cs))
+    np.testing.assert_allclose(pr["se_fit"].to_numpy(), num(r["se_fit"]), rtol=se_tol, err_msg=str(cs))
+    sm = b.summary()
+    pt = r["ptable"]
+    assert list(sm.p_table.index) == pt["names"], cs
+    np.testing.assert_allclose(sm.p_table["Estimate"], num(pt["est"]), rtol=1e-3, atol=10 * tol * yscale)
+    np.testing.assert_allclose(sm.p_table["Std. Error"], num(pt["se"]), rtol=se_tol, err_msg=str(cs))
+    np.testing.assert_allclose(sm.p_table["t value"], num(pt["t"]), rtol=se_tol, atol=1e-3, err_msg=str(cs))
+    np.testing.assert_allclose(sm.p_table["Pr(>|t|)"], num(pt["p"]), rtol=se_tol, atol=1e-12, err_msg=str(cs))
+    np.testing.assert_allclose(sm.residual_df, r["residual_df"], rtol=10 * tol)
+    np.testing.assert_allclose(sm.r_sq, r["r_sq"], rtol=10 * tol)
