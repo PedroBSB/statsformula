@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 try:
-    from sklearn.base import BaseEstimator, MetaEstimatorMixin, TransformerMixin, clone
+    from sklearn.base import BaseEstimator, MetaEstimatorMixin, RegressorMixin, TransformerMixin, clone
     from sklearn.utils.validation import check_is_fitted
 except ImportError as exc:  # pragma: no cover
     raise ImportError("statsformula.sklearn requires scikit-learn: pip install statsformula[sklearn]") from exc
@@ -36,7 +36,7 @@ from ._formula import Formula, RFormula, coerce_formula
 from ._model import ModelFrame
 from ._rtypes import Character, Factor, Logical, RError, RMatrix, as_factor
 
-__all__ = ["FormulaTransformer", "FormulaEstimator", "design_matrices", "response_matrix"]
+__all__ = ["FormulaTransformer", "FormulaEstimator", "GAMRegressor", "design_matrices", "response_matrix"]
 
 _Y_ENCODINGS = ("auto", "numeric", "onehot", "codes", "labels")
 
@@ -158,6 +158,16 @@ def _drop_intercept(X):
     return out
 
 
+def _penalties_for(spec, columns, remove_intercept):
+    """mgcv penalties of a fitted spec, with offsets shifted if the intercept is dropped."""
+    from ._mgcv import GamPenalty
+    pens = list(getattr(spec, "penalties", None) or [])
+    if remove_intercept and "(Intercept)" in columns:
+        i0 = list(columns).index("(Intercept)")
+        pens = [GamPenalty(p.name, p.smooth, p.S, p.off - (p.off > i0), p.rank) for p in pens]
+    return pens
+
+
 def _spec_transform(spec, data, na_action):
     # R's predict() warns "contrasts dropped from factor C(...)" because model.frame(xlev=)
     # re-creates the factor; the stored contrasts are re-applied, so it is noise here.
@@ -228,7 +238,16 @@ class FormulaTransformer(TransformerMixin, BaseEstimator):
         self.n_features_in_ = data.shape[1]
         self.feature_names_out_ = np.asarray([c for c in cols if not (self.remove_intercept and c == "(Intercept)")],
                                              dtype=object)
+        self.penalties_ = _penalties_for(self.model_spec_, cols, self.remove_intercept)
         return self
+
+    def penalty_matrix(self, sp=None):
+        """``sum_j sp[j] * S_j`` over the output columns: mgcv's smoothing penalties
+        (``s()``, ``te()``, ``ti()`` terms; zero elsewhere).  Use it to fit a
+        generalized ridge ``||y - X b||^2 + b' P b``; see also :class:`GAMRegressor`."""
+        from ._mgcv import penalty_matrix
+        check_is_fitted(self, "penalties_")
+        return penalty_matrix(self.penalties_, len(self.feature_names_out_), sp)
 
     def transform(self, X):
         check_is_fitted(self, "model_spec_")
@@ -373,6 +392,7 @@ class FormulaEstimator(MetaEstimatorMixin, BaseEstimator):
         self.feature_names_in_ = np.asarray([str(c) for c in data.columns], dtype=object)
         Xd = Xm.drop(columns="(Intercept)") if (self.remove_intercept and "(Intercept)" in Xm.columns) else Xm
         self.design_columns_ = list(Xd.columns)
+        self.penalties_ = _penalties_for(self.model_spec_, list(Xm.columns), self.remove_intercept)
         Xd = pd.DataFrame(Xd.to_numpy(), columns=self.design_columns_)
         params = {}
         for k, v in fit_params.items():
@@ -420,6 +440,144 @@ class FormulaEstimator(MetaEstimatorMixin, BaseEstimator):
         if sample_weight is None:
             return self.estimator_.score(Xd, yv)
         return self.estimator_.score(Xd, yv, sample_weight=sample_weight)
+
+    def get_feature_names_out(self, input_features=None):
+        check_is_fitted(self, "design_columns_")
+        return np.asarray(self.design_columns_, dtype=object)
+
+
+# ---------------------------------------------------------------------------
+# Penalized GAM regressor
+# ---------------------------------------------------------------------------
+
+class GAMRegressor(RegressorMixin, BaseEstimator):
+    """Gaussian GAM with mgcv's smoothing penalties (``mgcv::gam(formula, method=)``).
+
+    The design matrix and the wiggliness penalties ``S_j`` are mgcv's; the
+    coefficients minimise ``||y - X b||^2_W + sum_j sp_j b' S_j b`` with the
+    smoothing parameters ``sp`` estimated by REML or GCV (matching ``mgcv``'s
+    ``sp``, coefficients and fitted values) or fixed by the user.
+
+    >>> GAMRegressor("y ~ f + s(x) + te(x, z)").fit(df).predict(new)   # doctest: +SKIP
+
+    Parameters
+    ----------
+    formula : str
+        Formula with ``s()``, ``te()``, ``ti()`` smooths.  ``cbind(y1, y2) ~ ...``
+        fits one GAM per response (each with its own smoothing parameters).
+    method : {"REML", "GCV.Cp"}
+    sp : array-like, optional
+        Fixed smoothing parameters (one per penalty, in ``penalties_`` order);
+        negative entries are estimated.  A tunable hyper-parameter for ``GridSearchCV``.
+    gamma : float, default 1
+        GCV inflation of the effective degrees of freedom (``mgcv``'s ``gamma``).
+    knots : dict, optional
+        mgcv ``knots`` argument.
+    na_action, env : see :class:`FormulaEstimator`.
+
+    Attributes
+    ----------
+    coef_ : ndarray (n_features,) or (n_responses, n_features)
+    sp_ : ndarray of smoothing parameters (per response for ``cbind``)
+    edf_ : total effective degrees of freedom; ``scale_`` : residual variance
+    penalties_ : list of :class:`statsformula.GamPenalty`
+    design_columns_, response_names_, fits_ (the per-response fits)
+    """
+
+    def __init__(self, formula: str = "y ~ s(x)", method: str = "REML", sp=None, gamma: float = 1.0,
+                 knots: Optional[dict] = None, na_action: str = "na.omit", env: Optional[dict] = None):
+        self.formula = formula
+        self.method = method
+        self.sp = sp
+        self.gamma = gamma
+        self.knots = knots
+        self.na_action = na_action
+        self.env = env
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.target_tags.required = False
+        tags.input_tags.string = True
+        tags.input_tags.categorical = True
+        tags.input_tags.allow_nan = True
+        return tags
+
+    def fit(self, X, y=None, sample_weight=None):
+        from ._gamfit import fit_penalized
+        from ._mgcv import gam_model_matrix, has_smooths
+        data = _as_frame(X).reset_index(drop=True)
+        env = {} if self.env is None else self.env
+        f = coerce_formula(self.formula, env)
+        if y is not None:
+            rhs_f = f.delete_response()
+            Xm = (gam_model_matrix(rhs_f, data, knots=self.knots, na_action=self.na_action, env=env)
+                  if has_smooths(rhs_f) else model_matrix(rhs_f, data, na_action=self.na_action, env=env))
+            yv = np.asarray(y, dtype=float)
+            Y = pd.DataFrame(yv.reshape(len(data), -1), index=data.index).loc[Xm.index]
+            Y.columns = ["y"] if Y.shape[1] == 1 else ["y%d" % (i + 1) for i in range(Y.shape[1])]
+        else:
+            Xm = (gam_model_matrix(f, data, knots=self.knots, na_action=self.na_action, env=env)
+                  if has_smooths(f) else model_matrix(f, data, na_action=self.na_action, env=env))
+            mf = _response_model_frame(f, data, self.na_action, env)
+            Y = response_matrix(mf, f, "numeric")
+            if Y is None:
+                raise RError("the formula has no left-hand side (response)")
+            Y = Y.loc[Xm.index]
+        w = None if sample_weight is None else np.asarray(sample_weight, dtype=float)[np.asarray(Xm.index)]
+        self.model_spec_ = Xm.model_spec
+        self.design_columns_ = list(Xm.columns)
+        self.response_names_ = list(map(str, Y.columns))
+        self.penalties_ = list(getattr(Xm.model_spec, "penalties", None) or [])
+        self.n_features_in_ = data.shape[1]
+        self.feature_names_in_ = np.asarray([str(c) for c in data.columns], dtype=object)
+        A = Xm.to_numpy()
+        self.fits_ = [fit_penalized(A, Y.iloc[:, j].to_numpy(dtype=float), self.penalties_, method=self.method,
+                                    sp=self.sp, weights=w, gamma=self.gamma) for j in range(Y.shape[1])]
+        one = len(self.fits_) == 1
+        stack = (lambda a: a[0]) if one else np.vstack
+        self.coef_ = stack([ft.coef for ft in self.fits_])
+        self.sp_ = stack([ft.sp for ft in self.fits_])
+        self.edf_ = self.fits_[0].edf.sum() if one else np.array([ft.edf.sum() for ft in self.fits_])
+        self.scale_ = self.fits_[0].scale if one else np.array([ft.scale for ft in self.fits_])
+        self.sp_names_ = [p.name for p in self.penalties_]
+        return self
+
+    def _design(self, X):
+        check_is_fitted(self, "model_spec_")
+        M = _spec_transform(self.model_spec_, _as_frame(X), "na.pass")
+        return M.to_numpy() if isinstance(M, pd.DataFrame) else np.asarray(M)
+
+    def predict(self, X):
+        return self._design(X) @ np.asarray(self.coef_).T
+
+    def transform(self, X):
+        """The (lpmatrix) design matrix for new data."""
+        return pd.DataFrame(self._design(X), columns=self.design_columns_)
+
+    def penalty_matrix(self, sp=None):
+        """``sum_j sp_j S_j`` (defaults to the fitted smoothing parameters of the first response)."""
+        from ._mgcv import penalty_matrix
+        check_is_fitted(self, "penalties_")
+        if sp is None:
+            sp = self.fits_[0].sp
+        return penalty_matrix(self.penalties_, len(self.design_columns_), sp)
+
+    def score(self, X, y=None, sample_weight=None):
+        from sklearn.metrics import r2_score
+        data = _as_frame(X).reset_index(drop=True)
+        if y is None:
+            env = {} if self.env is None else self.env
+            f = coerce_formula(self.formula, env)
+            mf = _response_model_frame(f, data, self.na_action, env)
+            Y = response_matrix(mf, f, "numeric")
+            rows = np.asarray(mf.index)
+            data = data.iloc[rows]
+            y = Y.to_numpy(dtype=float)
+            if Y.shape[1] == 1:
+                y = y[:, 0]
+            if sample_weight is not None:
+                sample_weight = np.asarray(sample_weight)[rows]
+        return r2_score(y, self.predict(data), sample_weight=sample_weight)
 
     def get_feature_names_out(self, input_features=None):
         check_is_fitted(self, "design_columns_")

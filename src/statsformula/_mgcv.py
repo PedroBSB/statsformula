@@ -1502,6 +1502,65 @@ def interpret_gam(formula, env=None) -> GamFormula:
     return GamFormula(RFormula(pf, f.env), pfok, smooth_spec, RFormula(fake, f.env), response, av, pav)
 
 
+class GamPenalty:
+    """One smoothing penalty of a GAM, as in ``gam(..., fit = FALSE)``: ``S`` is the
+    penalty on the coefficients ``off : off + S.shape[0]`` (0-based ``G$off - 1``),
+    ``name`` the smoothing-parameter name (``names(G$sp)``) and ``rank`` ``G$rank``."""
+
+    __slots__ = ("name", "smooth", "S", "off", "rank")
+
+    def __init__(self, name, smooth, S, off, rank):
+        self.name, self.smooth, self.S, self.off, self.rank = name, smooth, S, off, rank
+
+    @property
+    def columns(self):
+        return slice(self.off, self.off + self.S.shape[0])
+
+    def full(self, p):
+        """The penalty embedded in a ``p x p`` matrix (zero outside this smooth's columns)."""
+        P = np.zeros((p, p))
+        P[self.columns, self.columns] = self.S
+        return P
+
+    def __repr__(self):
+        return "<GamPenalty %s: %dx%d at column %d, rank %d>" % (self.name, self.S.shape[0], self.S.shape[1],
+                                                                 self.off, self.rank)
+
+
+def _penalty_rank(S):
+    """Rank of a penalty (mgcv's ``sm$rank``): numerical rank of the symmetric matrix."""
+    if not S.size:
+        return 0
+    ev = np.linalg.eigvalsh((S + S.T) / 2)
+    return int(np.sum(ev > ev.max() * DBL_EPS ** 0.75)) if ev.max() > 0 else 0
+
+
+def gam_penalties(smooths, first_col):
+    """``G$S``, ``G$off``, ``G$rank`` and ``names(G$sp)`` of ``gam(..., fit = FALSE)``."""
+    out = []
+    off = first_col
+    for sm in smooths:
+        Ss = sm.S or []
+        for j, S_ in enumerate(Ss):
+            name = sm.label + (str(j + 1) if len(Ss) > 1 else "")
+            rks = getattr(sm, "S_rank", None)
+            rk = rks[j] if rks is not None else _penalty_rank(S_)
+            out.append(GamPenalty(name, sm.label, np.array(S_, dtype=float), off, rk))
+        off += sm.X.shape[1]
+    return out
+
+
+def penalty_matrix(penalties, p, sp=None):
+    """``sum_j sp[j] * S_j`` embedded in a ``p x p`` matrix (``sp`` defaults to 1)."""
+    P = np.zeros((p, p))
+    if sp is None:
+        sp = np.ones(len(penalties))
+    sp = np.broadcast_to(np.asarray(sp, dtype=float), (len(penalties),))
+    for lam, pen in zip(sp, penalties):
+        P[pen.columns, pen.columns] += lam * pen.S
+    return P
+
+
 class GamSpec:
     """Stores everything needed to rebuild the gam model matrix on new data
     (equivalent of ``predict.gam(..., type = "lpmatrix")``)."""
@@ -1513,6 +1572,7 @@ class GamSpec:
         self.smooths = smooths
         self.columns = columns
         self.env = env
+        self.penalties = []
 
     def get_model_matrix(self, data, output: str = "pandas"):
         import pandas as pd
@@ -1566,6 +1626,7 @@ def gam_model_matrix(formula, data, knots=None, na_action: Optional[str] = None,
         assign.extend([len(pterms.term_labels) + i + 1] * sm.X.shape[1])
     X = np.hstack(blocks)
     spec = GamSpec(gp, pterms, Xp.model_spec, smooths, cols, env)
+    spec.penalties = gam_penalties(smooths, Xp.shape[1])
     if output == "numpy":
         return X
     mm = ModelMatrix(X, index=mf.index, columns=pd.Index(cols, dtype=object))
@@ -1720,6 +1781,15 @@ def gam_side(smooths, Xp, tol=DBL_EPS ** 0.5):
             if ind:
                 sm.X = np.delete(sm.X, ind, axis=1)
                 sm.del_index = (sm.del_index or []) + list(ind)
+                if sm.S:
+                    keep, ranks = [], []
+                    for S_ in sm.S:
+                        S_ = np.delete(np.delete(S_, ind, axis=0), ind, axis=1)
+                        rk = LinpackQR(S_, tol=tol).rank if np.any(S_ != 0) else 0
+                        if rk > 0:
+                            keep.append(S_)
+                            ranks.append(rk)
+                    sm.S, sm.S_rank = keep, ranks
     for sm in smooths:
         sm.Xa = None
     return smooths

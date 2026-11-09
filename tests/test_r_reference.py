@@ -172,6 +172,9 @@ def _run(cs, k):
         from statsformula.sklearn import FormulaEstimator
         d = DATA[cs["data"]]
         return FormulaEstimator(cs["formula"], LinearRegression(fit_intercept=False)).fit(d), d
+    if k == "gamfit":
+        import test_mgcv_helpers
+        return test_mgcv_helpers.run_gamfit_case(cs, DATA)
     if k == "gampen":
         import test_mgcv_helpers
         return test_mgcv_helpers.run_gampen_case(cs, DATA)
@@ -270,6 +273,9 @@ def test_against_r(case):
             else np.asarray(est.predict(d.loc[Xd.index]))
         Rf = np.column_stack([num(c) for c in r["fitted"]])
         np.testing.assert_allclose(fitted, Rf, rtol=1e-7, atol=1e-9)
+    elif k == "gamfit":
+        import test_mgcv_helpers
+        test_mgcv_helpers.check_gamfit_case(res, r, cs)
     elif k == "gampen":
         import test_mgcv_helpers
         test_mgcv_helpers.check_gampen_case(res, r, cs)

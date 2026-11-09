@@ -159,3 +159,53 @@ def test_pickle_roundtrip(df):
 def test_custom_functions_via_env(df):
     tr = FormulaTransformer("~ sq(z)", env={"sq": np.square}).fit(df)
     np.testing.assert_allclose(tr.transform(df)["sq(z)"], df.z ** 2)
+
+
+# -- mgcv penalties / GAMRegressor ---------------------------------------------
+
+from statsformula.sklearn import GAMRegressor  # noqa: E402
+
+
+def test_transformer_exposes_penalties(df):
+    tr = FormulaTransformer("~ g + s(x) + te(x, z, k = 4)").fit(df)
+    names = [p.name for p in tr.penalties_]
+    assert names == ["s(x)", "te(x,z)1", "te(x,z)2"]
+    X = tr.transform(df)
+    P = tr.penalty_matrix([1.0, 2.0, 3.0])
+    assert P.shape == (X.shape[1], X.shape[1])
+    np.testing.assert_allclose(P, P.T)
+    assert np.all(P[:3] == 0) and np.all(P[:, :3] == 0)  # parametric columns are unpenalized
+    tr0 = FormulaTransformer("~ g + s(x)", remove_intercept=True).fit(df)
+    p0 = tr0.penalties_[0]
+    assert list(tr0.get_feature_names_out()[p0.columns]) == ["s(x).%d" % i for i in range(1, 10)]
+    assert FormulaTransformer("~ g + x").fit(df).penalties_ == []
+
+
+def test_penalty_matrix_generalized_ridge_equals_gam(df):
+    b = sf.gam("y1 ~ g + s(x) + s(z)", df, method="REML")
+    X = b.model_matrix.to_numpy()
+    P = b.penalty_matrix()
+    beta = np.linalg.solve(X.T @ X + P, X.T @ df["y1"].to_numpy())
+    np.testing.assert_allclose(beta, b.coefficients.to_numpy(), rtol=1e-8, atol=1e-10)
+
+
+def test_gam_regressor(df):
+    est = GAMRegressor("y1 ~ g + s(x) + s(z, bs = 'cr')").fit(df)
+    b = sf.gam("y1 ~ g + s(x) + s(z, bs = 'cr')", df)
+    np.testing.assert_allclose(est.sp_, b.sp.to_numpy())
+    np.testing.assert_allclose(est.predict(df.head(5)), b.predict(df.head(5)).to_numpy())
+    assert est.score(df) > 0.97 and is_regressor(est)
+    assert est.sp_names_ == ["s(x)", "s(z)"]
+    # fixed smoothing parameters, tuned by grid search
+    grid = GridSearchCV(GAMRegressor("y1 ~ g + s(x) + s(z)"), {"sp": [[1e-3, 1e-3], [10.0, 10.0], [1e4, 1e4]]}, cv=3)
+    grid.fit(df)
+    assert grid.best_params_["sp"] != [1e4, 1e4]
+    # weights and multiple responses
+    w = np.linspace(0.5, 2, len(df))
+    ew = GAMRegressor("y1 ~ s(x)", method="GCV.Cp").fit(df, sample_weight=w)
+    bw = sf.gam("y1 ~ s(x)", df.assign(w=w), method="GCV.Cp", weights="w")
+    np.testing.assert_allclose(ew.coef_, bw.coefficients.to_numpy())
+    em = GAMRegressor("cbind(y1, y2) ~ g + s(x) + s(z)").fit(df)
+    assert em.predict(df.head(3)).shape == (3, 2) and em.sp_.shape == (2, 2)
+    est2 = pickle.loads(pickle.dumps(est))
+    np.testing.assert_allclose(est2.predict(df), est.predict(df))

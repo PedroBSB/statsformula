@@ -11,6 +11,17 @@
     pipeline; compatible with `clone`, `GridSearchCV` (including searching over formulas),
     `cross_val_score`, sample weights and pickling.
   * `design_matrices(formula, data)`: aligned `(Y, X)` with multi-column responses.
+* mgcv smoothing penalties: the design matrix of a GAM carries `model_spec.penalties`
+  (`GamPenalty`: `S`, column offset, rank and name, as `G$S`/`G$off`/`G$rank` of
+  `gam(..., fit = FALSE)`); `penalty_matrix(penalties, p, sp)` builds `sum_j sp_j S_j`;
+  `FormulaTransformer.penalties_` / `.penalty_matrix()` and `FormulaEstimator.penalties_` are
+  aligned with the output columns.
+* `gam(formula, data, method="REML"|"GCV.Cp", sp=, weights=, gamma=)`: Gaussian penalized
+  regression with smoothing parameters estimated like `mgcv::gam` (validated on 18 fits:
+  sp, coefficients, fitted values, predictions, edf, scale); `GAMRegressor` is its
+  scikit-learn estimator (multi-response `cbind`, `sp` tunable by `GridSearchCV`).
+* Fix: `gam.side()` now also removes the deleted columns from the smooths' penalties (and
+  drops penalties left empty), as mgcv does.
 * Linear-model coefficients of `FormulaEstimator(..., LinearRegression(fit_intercept=False))`
   validated against R's `lm()` (including multi-response `mlm` fits).
 

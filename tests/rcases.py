@@ -64,7 +64,18 @@ def make_datasets():
     nb = 2500
     d5 = pd.DataFrame({"y": np.round(rng.normal(0, 1, nb), 4), "x": np.round(rng.uniform(0, 10, nb), 5),
                        "z": np.round(rng.normal(0, 1, nb), 5)})
-    return {"d1": d1, "d2": d2, "d3": d3, "d4": d4, "dx": dx, "d4small": d4, "d5": d5}
+    # smooth signal for penalized GAM fits
+    n6 = 150
+    x6 = np.round(rng.uniform(0, 10, n6), 4)
+    z6 = np.round(rng.normal(0, 1, n6), 4)
+    f6 = pd.Categorical(rng.choice(["a", "b", "c"], n6), categories=["a", "b", "c"])
+    eff = np.array([0.0, 0.8, -0.5])[f6.codes]
+    d6 = pd.DataFrame({"x": x6, "z": z6, "f": f6, "w": np.round(rng.uniform(0.5, 2, n6), 4),
+                       "y": np.round(np.sin(x6 / 1.5) + 0.4 * z6 ** 2 + 0.2 * x6 * z6 / 5 + eff
+                                     + rng.normal(0, 0.3, n6), 4)})
+    d6new = d6.iloc[:10].copy().reset_index(drop=True)
+    d6new["x"] = np.round(np.linspace(0.5, 9.5, 10), 4)
+    return {"d1": d1, "d2": d2, "d3": d3, "d4": d4, "dx": dx, "d4small": d4, "d5": d5, "d6": d6, "d6new": d6new}
 
 
 def schema(df):
@@ -290,3 +301,20 @@ LM = [{"kind": "lm", "formula": f, "data": "d2"} for f in [
     "log(w) ~ f + g:x + o", "cbind(y, y2) ~ h + bs(x, df = 4) - 1",
 ]]
 ALL_CASES = ALL_CASES + LM
+
+GAMFIT = []
+for f, method, extra in [
+    ("y ~ s(x)", "REML", {}), ("y ~ s(x)", "GCV.Cp", {}), ("y ~ f + s(x) + s(z)", "REML", {}),
+    ("y ~ f + s(x) + s(z)", "GCV.Cp", {}), ("y ~ s(x, bs = \"cr\", k = 12) + s(z, bs = \"ps\")", "REML", {}),
+    ("y ~ te(x, z)", "REML", {}), ("y ~ te(x, z, bs = \"cr\", k = c(5, 4))", "GCV.Cp", {}),
+    ("y ~ s(x, z, k = 20)", "REML", {}), ("y ~ f + s(x, by = f)", "REML", {}),
+    ("y ~ s(x) + s(z) + ti(x, z, k = 4)", "REML", {}), ("y ~ s(x, bs = \"cs\") + s(z, bs = \"ts\")", "REML", {}),
+    ("y ~ s(x, bs = \"cc\") + s(f, bs = \"re\")", "REML", {}), ("y ~ s(x) + te(x, z, k = 4)", "REML", {}),
+    ("y ~ s(x) + s(z)", "REML", {"weights": "w"}), ("y ~ s(x) + s(z)", "GCV.Cp", {"gamma": 1.4}),
+    ("y ~ f + s(x) + s(z)", "REML", {"sp": [0.5, 3.0]}), ("y ~ te(x, z, k = 4)", "REML", {"sp": [0.1, 2.0]}),
+    ("y ~ s(x, bs = \"bs\") + z", "REML", {}),
+]:
+    c = {"kind": "gamfit", "formula": f, "data": "d6", "newdata": "d6new", "method": method}
+    c.update(extra)
+    GAMFIT.append(c)
+ALL_CASES = ALL_CASES + GAMFIT
