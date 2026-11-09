@@ -13,6 +13,13 @@
   * Validated against R: `lm()` per equation and propagated predictions on 8 models, and
     `lavaan::sem()` estimates and total effects (uncorrelated disturbances) on 5 of them.
 * `parse_path_model()` / `PathEquation`.
+* SEM backends (`statsformula.sem`): `sem_data()` rewrites R-expression terms of a lavaan model
+  into columns (stateful `transform()`); `fit_semopy()` / `to_semopy()`, `fit_pysem()` /
+  `to_pysem()` (twoertwein/pySEM, LISREL translation, L-BFGS fit) and `fit_pysemforge()` /
+  `to_pysemforge()` fit lavaan's full model and return lavaan-style estimates with `:=`
+  parameters. Validated against lavaan 0.7.3 on 7 models. Works around a semopy 2.3 infinite
+  loop for factors without a fixed loading; warns about pysemforge 0.1.0's random refit and
+  zeroed fit indices. New extra: `statsformula[sem]` (semopy).
 
 ## 0.3.0 (2026-11-09)
 

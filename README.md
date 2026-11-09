@@ -50,6 +50,8 @@ Matrix 1.7-3); the fixtures are in `tests/fixtures` and can be regenerated with
 * penalty matrices of every mgcv model (`G$S`, `G$off`, `G$rank`, smoothing-parameter names) and
   18 penalized GAM fits (`gam(method = "REML" / "GCV.Cp")`, fixed `sp`, weights, `gamma`):
   smoothing parameters, coefficients, fitted values, predictions, edf and scale;
+* 7 SEM models fitted through semopy and pySEM compared with `lavaan::sem()`/`cfa()`
+  (`tools/make_sem_fixtures.py`);
 * 8 path models: `lm()` per equation, propagated predictions, and `lavaan::sem()` estimates and
   total effects (`tools/make_path_fixtures.py`);
 * 132 lavaan model strings and 353 option/preset combinations compared with lavaan 0.7.3
@@ -244,6 +246,52 @@ equation's prediction into the equations downstream (needs a recursive model);
 `lavaan::sem()` with observed variables and uncorrelated disturbances
 (`auto.cov.y = FALSE`). Latent variables (`=~`) and covariances (`~~`) are not fitted; parse
 those models with `lavaanify()`.
+
+### SEM backends: semopy, pySEM, pysemforge (`statsformula.sem`)
+
+statsformula lets a lavaan model use R expressions and fits it with a Python SEM package.
+It rewrites the terms into columns (`log(w)` -> `log_w`, factors -> dummies, `poly()`,
+`x:z`, `I(z^2)`, with the transformations reusable on new data). `lavaanify()` then expands
+the model into lavaan's full parameter table, so each backend fits exactly the model lavaan
+would. Estimates come back in lavaan's format, with `:=` parameters evaluated:
+
+```python
+from statsformula.sem import fit_semopy, fit_pysem, sem_data, to_semopy, to_pysem
+
+model = """
+  ind =~ x1 + x2 + x3
+  m ~ a*ind + log(w) + f + z
+  y ~ b*m + ind + I(z^2)
+  ab := a*b
+"""
+fit = fit_semopy(model, df)          # semopy (pip install statsformula[sem])
+fit.estimates                        # lhs / op / rhs / label / free / est
+fit.defined                          # {'ab': ...}
+fit = fit_pysem(model, df)           # twoertwein/pySEM (PyTorch)
+fit_semopy(model, df, preset="cfa", std_lv=True)   # lavaanify options
+
+desc, data, sd, partable = to_semopy(model, df)    # inputs for semopy.Model(desc).fit(data)
+kwargs, sd, partable, names = to_pysem(model, df)  # pysem.sem.SEM(**kwargs)
+sd = sem_data(model, df); sd.model, sd.data, sd.transform(new_df)
+```
+
+* **semopy:** the bridge writes the lavaan model out explicitly in semopy syntax and fits it
+  with a tight SLSQP tolerance. It also works around a semopy 2.3 hang on factors with no
+  fixed loading (`std.lv = TRUE`).
+* **pySEM:** pySEM uses LISREL all-y matrices, so observed variables in regressions get
+  single-indicator stand-ins (`"eta:<name>"`). It is fitted to convergence with PyTorch
+  L-BFGS instead of pySEM's Adam loop, which also uses `np.Inf`, removed in NumPy 2. pySEM has
+  no equality constraints.
+* **pysemforge:** `to_pysemforge()` gives the plain syntax and data that pysemforge reads.
+  Version 0.1.0 refits a random sample drawn from the covariance matrix instead of your data,
+  and reports chi-square = 0, df = 0, CFI = 1 because of a missing import.
+  `fit_pysemforge()` warns about this; use `fit_semopy()` for correct estimates.
+
+Validated against lavaan 0.7.3 on 7 models (Holzinger-Swineford CFA, `std.lv`, second-order
+factor, MIMIC with factor and `log()` covariates, Political Democracy with indirect/total
+effects, latent and observed path models with R expressions). semopy matches to about 2e-5
+and pySEM to about 5e-5. The exception is one model where two covariates correlate at 0.999,
+where pySEM matches only to about 1e-2.
 
 ### lavaan model syntax (structural equation models)
 
