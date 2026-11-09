@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "statsformula"
+dynamic = ["version"]
+description = "R model formulas for Python: terms, model.frame, model.matrix, sparse.model.matrix, Formula (multi-part) and mgcv smooths, validated against R."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-2.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Pedro Albuquerque", email = "pedro.melo.albuquerque@gmail.com" }]
+keywords = ["formula", "R", "model matrix", "design matrix", "statistics", "regression", "mgcv", "gam", "splines", "patsy", "formulaic", "statsmodels"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Typing :: Typed",
+]
+dependencies = ["numpy>=1.22", "pandas>=1.4", "scipy>=1.8"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+statsmodels = ["statsmodels>=0.13"]
+
+[project.urls]
+Homepage = "https://github.com/PedroBSB/statsformula"
+Source = "https://github.com/PedroBSB/statsformula"
+Issues = "https://github.com/PedroBSB/statsformula/issues"
+Changelog = "https://github.com/PedroBSB/statsformula/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/statsformula/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/statsformula"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/statsformula", "tests", "tools", "README.md", "LICENSE", "CHANGELOG.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+addopts = "-p no:cacheprovider"
