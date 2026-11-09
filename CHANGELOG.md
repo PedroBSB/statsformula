@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0 (2026-11-09)
+
+* lavaan model syntax: `lavaan_parse()` (port of `lavParseModelString()`), `lavaanify()`
+  (port of `lavaanify()`, with `preset="cfa"|"sem"|"growth"`), `lavaan_partable()`, `lavaan_names()`;
+  validated against lavaan 0.7.3 on 132 model strings and 317 option combinations.
+* mgcv `gam.side()`: identifiability side constraints for smooths sharing covariates
+  (`s(x) + te(x, z)`, `s(x) + s(x, z)`, ...), including prediction on new data.
+* mgcv penalty matrices for all supported bases (`smooth_con(...)[i].S`), including the
+  `bs` basis derivative penalty; validated against R's `smoothCon()`.
+* Removed the "gam.side not implemented" warning.
+
 ## 0.1.0 (2026-11-09)
 
 First release.

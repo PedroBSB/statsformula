@@ -261,4 +261,26 @@ for f, extra in [
     GAM.append(c)
 GAM.append({"kind": "gam", "formula": "y ~ s(x)", "data": "d5"})
 GAM.append({"kind": "gam", "formula": "y ~ s(x, z, k = 12)", "data": "d5"})
+SIDE = [
+    ("y ~ s(x) + te(x, z)", {"newdata": "d3"}), ("y ~ s(x) + s(x, z)", {"newdata": "d3"}),
+    ("y ~ s(x, bs = \"cr\") + s(z, bs = \"cr\") + te(x, z)", {"newdata": "d3"}),
+    ("y ~ s(x) + s(z) + s(x, z, k = 20)", {}), ("y ~ te(x, z) + te(x, z, w, k = 3)", {}),
+    ("y ~ s(x, bs = \"ps\") + te(x, z, bs = \"ps\")", {}), ("y ~ s(x, bs = \"cc\") + te(x, z)", {}),
+    ("y ~ s(x, k = 5, fx = TRUE) + te(x, z)", {}), ("y ~ s(x, bs = \"cs\") + s(x, z, bs = \"ts\", k = 15)", {}),
+    ("y ~ s(x, bs = \"cp\") + te(x, w, bs = c(\"cp\", \"cr\"))", {}), ("y ~ f + s(x) + s(x, by = f)", {}),
+    ("y ~ s(x) + s(z) + te(x, z) + s(w)", {"newdata": "d3"}), ("y ~ s(x) + ti(x, z) + te(x, z)", {}),
+    ("y ~ x + s(x) + te(x, z)", {}), ("y ~ s(x) + te(x, z) - 1", {}),
+    ("y ~ s(x, bs = \"bs\") + te(x, z, bs = \"bs\")", {"newdata": "d3"}),
+]
+for f, extra in SIDE:
+    c = {"kind": "gam", "formula": f, "data": "d1"}
+    c.update(extra)
+    GAM.append(c)
+for sm in ["s(x)", "s(x, k = 6)", "s(x, bs = \"ts\")", "s(x, z)", "s(x, z, k = 12)", "s(x, bs = \"cr\")",
+           "s(x, bs = \"cs\")", "s(x, bs = \"cc\")", "s(x, bs = \"ps\")", "s(x, bs = \"ps\", m = c(3, 1), k = 8)",
+           "s(x, bs = \"cp\")", "s(f, bs = \"re\")", "te(x, z)", "te(x, z, bs = c(\"tp\", \"cr\"))", "ti(x, z)",
+           "te(x, z, bs = \"ps\")", "s(x, by = f)", "s(x, by = z)", "te(x, z, w, k = 3)",
+           "s(x, bs = \"bs\")", "s(x, bs = \"bs\", m = c(3, 1), k = 8)", "s(x, bs = \"bs\", m = c(2, 0), k = 7)",
+           "s(x, bs = \"bs\", m = c(4, 2))", "te(x, z, bs = \"bs\")"]:
+    GAM.append({"kind": "gampen", "smooth": sm, "data": "d1"})
 ALL_CASES = ALL_CASES + GAM

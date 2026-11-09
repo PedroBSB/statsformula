@@ -39,13 +39,16 @@ The test-suite compares against results produced by R 4.5.1 (mgcv 1.9-3, Formula
 Matrix 1.7-3); the fixtures are in `tests/fixtures` and can be regenerated with
 `python tools/make_fixtures.py`, `tools/make_fuzz.py` and `tools/make_fuzz_mm.py` (needs R).
 
-* 367 hand-written cases: `terms` attributes, `model.matrix` values, column names, `assign` and
+* 407 hand-written cases: `terms` attributes, `model.matrix` values, column names, `assign` and
   `contrasts`, `sparse.model.matrix`, `model.frame` (NA handling, subset, weights, offset,
   `drop.unused.levels`), `update`, `reformulate`, `drop.terms`, `delete.response`, the Formula
-  package, prediction on new data, error messages and 41 mgcv smooth models;
+  package, prediction on new data, error messages, 57 mgcv models (16 of them needing
+  `gam.side()` side constraints) and 24 mgcv penalty matrices;
 * 500 randomly generated formulas compared with R's `terms()` (2,000 more checked during
   development);
-* 400 randomly generated formulas compared with R's `model.matrix()`.
+* 400 randomly generated formulas compared with R's `model.matrix()`;
+* 132 lavaan model strings and 353 option/preset combinations compared with lavaan 0.7.3
+  (`tools/make_lavaan_fixtures.py`).
 
 Numbers agree to ~1e-12 relative error; names, orderings and attributes are identical.
 
@@ -132,6 +135,46 @@ X_test = X.model_spec.get_model_matrix(test)        # same transformation, level
 S = sf.sparse_model_matrix("~ user * item", big_df)  # scipy.sparse
 ```
 
+### lavaan model syntax (structural equation models)
+
+`sf.lavaan_parse()` is a port of `lavaan::lavParseModelString(model, as.data.frame. = TRUE)`
+and `sf.lavaanify()` of `lavaan::lavaanify()` (lavaan 0.7.3), validated against R on 132 model
+strings (parser output, 317 `lavaanify()` option combinations, 36 `cfa()`/`sem()`/`growth()`
+parameter tables).
+
+```python
+model = """
+  # measurement model
+    ind60 =~ x1 + x2 + x3
+    dem60 =~ y1 + a*y2 + b*y3 + c*y4
+  # regressions
+    dem60 ~ ind60
+  # residual correlations and a defined parameter
+    y1 ~~ y2
+    ab := a*b
+"""
+flat = sf.lavaan_parse(model)            # lhs, op, rhs, block, label, ..., mod.idx
+flat.attrs["constraints"]                # [{'op': ':=', 'lhs': 'ab', 'rhs': 'a*b', 'user': 1}]
+pt = sf.lavaanify(model, preset="sem")   # the parameter table lavaan::sem() builds
+pt = sf.lavaanify(model, auto_var=True, std_lv=True, meanstructure=True)   # or "std.lv" style keys
+sf.lavaan_names(model, "ov.x")           # like lavNames()
+```
+
+Supported: all operators (`=~ ~ ~~ ~1 | ~*~ <~ := == < > :~ %`), comments (`#`, `!`), `;`,
+line continuation, modifiers (`a*x`, `0.5*x`, `NA*x`, `start()`, `0.5?x`, `label()`,
+`equal()`, `lower()`, `upper()`, `c()` vectors for multiple groups, `efa("set")*f` blocks,
+combined modifiers), simple bounds on labels (`a > 0` becomes a lower bound, as in lavaan),
+interactions `x1:x2`, `group:`/`level:`/`class:`/`block:` blocks, and lavaan's error messages
+and warnings (with line/position). `lavaanify()` options: `meanstructure`, `int.ov.free`,
+`int.lv.free`, `marker.int.zero`, `orthogonal(.x/.y/.efa)`, `std.lv`, `correlation`,
+`composites`, `conditional.x`, `fixed.x`, `parameterization`, `constraints`, `ceq.simple`,
+`auto`, `model.type`, `auto.fix.first`, `marker`, `auto.fix.single`, `auto.var`,
+`auto.cov.lv.x`, `auto.cov.x`, `auto.cov.y`, `auto.th`, `auto.delta`, `auto.efa`, `ngroups`,
+`nthresholds`, `group.equal`, `group.partial`, `group.w.free`. Not supported: `effect.coding`,
+the `:~` operator inside `lavaanify()`, `conditional.x` with `level:` blocks, and options that
+need data (`varTable`: ordered variables are only detected from `|` thresholds in the syntax;
+exogenous covariates are detected from the syntax, as `lavaanify()` does).
+
 ## Data types
 
 | pandas / numpy | R equivalent |
@@ -154,12 +197,15 @@ R built with ICU). Use `sf.set_collation("C")` to mimic `LC_COLLATE=C`. Unlike R
   generator (used for knot sampling above 2,000 unique points), so the basis matches R's
   reference LAPACK build exactly. R linked against a vendor LAPACK (OpenBLAS, MKL, Accelerate)
   can itself produce a different, equally valid sign convention.
-* **`gam.side()`** (side constraints mgcv adds when smooths share covariates, e.g.
-  `s(x) + te(x, z)`) is not implemented: a warning is issued and the columns can differ from R.
-  Use `ti()` for interaction terms (the mgcv recommendation), which needs no side constraints.
+* **`gam.side()`** side constraints (mgcv drops columns when smooths share covariates, e.g.
+  `s(x) + te(x, z)`) are applied exactly as mgcv does, using the smooths' penalty matrices.
+  Penalties match R's `smoothCon(...)$S`, except the `cs` shrinkage penalty: mgcv assigns
+  different values to the two null-space eigenvalues, and the null-space basis returned by
+  LAPACK's eigen-solver is arbitrary, so that penalty agrees with R only to ~1e-3. Model matrices
+  are not affected.
 * mgcv bases not yet available: `t2`, `fs`, `gp`, `ds`, `so`, `mrf`, `ad`, `sos`, `sz`, `re`
-  inside tensor products, smooths with matrix (summation convention) arguments; `id=`, `sp=` and
-  `fx=` only affect penalties, which statsformula does not compute (it builds model matrices).
+  inside tensor products, smooths with matrix (summation convention) arguments; `id=` and `sp=`
+  are accepted but ignored (they only matter when fitting).
 * R syntax that is not formula-related (`function`, `if`, assignment) is not supported inside
   formulas.
 * By default, R's functions take precedence over Python objects of the same name (for example a

@@ -160,6 +160,7 @@ run_case <- function(cs) {
     return(res)
   }
   if (k == "gam") return(gam_case(cs))
+  if (k == "gampen") return(list(smooths = gampen_case(cs)))
   stop("unknown case kind ", k)
 }
 

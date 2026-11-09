@@ -265,6 +265,20 @@ def _r_unique(x):
 # cubic regression splines (crspl / getFS in mgcv.c)
 # ---------------------------------------------------------------------------
 
+def _eig_desc(S):
+    w, V = np.linalg.eigh(S)
+    return w[::-1].copy(), V[:, ::-1].copy()
+
+
+def _shrink_cs(S, shrink):
+    """smooth.construct.cr: es$values[nk-1] <- es$values[nk-2]*shrink; es$values[nk] <- ...[nk-1]*shrink."""
+    w, V = _eig_desc(S)
+    nk = len(w)
+    w[nk - 2] = w[nk - 3] * shrink
+    w[nk - 1] = w[nk - 2] * shrink
+    return (V * w) @ V.T
+
+
 def _get_F(xk):
     n = len(xk)
     h = np.diff(xk)
@@ -282,6 +296,7 @@ def _get_F(xk):
     BinvD = np.linalg.solve(B, D)
     Mx = np.zeros((n, n))  # row j: second derivative at knot j as linear map of values
     Mx[1:n - 1, :] = BinvD
+    _get_F.last_S = D.T @ BinvD
     return Mx
 
 
@@ -352,6 +367,11 @@ class CRSmooth:
             raise RError("number of supplied knots != k for a cr smooth")
         self.xp = k
         self.Mx = _get_F(k)
+        S = _get_F.last_S
+        S = (S + S.T) / 2
+        if spec.bs == "cs":
+            S = _shrink_cs(S, 0.1)
+        self.S = [] if spec.fixed else [S]
         self.bs_dim = nk
         self.X = _crspl(x, k, self.Mx)
 
@@ -437,6 +457,8 @@ class CCSmooth:
         D[nn - 1, nn - 1] = -(1 / h[nn - 2] + 1 / h[nn - 1])
         D[nn - 1, 0] = 1 / h[nn - 1]
         self.BD = np.linalg.solve(B, D)
+        S = D.T @ self.BD
+        self.S = [] if spec.fixed else [(S + S.T) / 2]
         self.xp = k
         self.bs_dim = nk
         self.X = self._pred(x)
@@ -502,6 +524,54 @@ def _c_spline_des(x, knots, ord_=4, derivs=0):
     return X1
 
 
+def _bspline_penalties(knots, m1, m2s, nk):
+    """Penalties of mgcv's "bs" basis: integrated squared m2-th derivative
+    (port of smooth.construct.bs.smooth.spec)."""
+    import scipy.linalg as sl
+    k0 = knots[m1:m1 + nk]
+    out = []
+    for m2 in m2s:
+        pord = m1 - m2
+        if pord < 0:
+            raise RError("requested non-existent derivative in B-spline penalty")
+        h = np.diff(k0)
+        if pord == 0:
+            k1 = (k0[1:] + k0[:-1]) / 2
+        else:
+            k1 = np.cumsum(np.concatenate([[k0[0]], np.repeat(h / pord, pord)]))
+        D = spline_design(knots, k1, m1 + 1, [m2])
+        if pord == 0:
+            D1 = np.sqrt(h)[:, None] * D
+        else:
+            sv = np.linspace(-1, 1, pord + 1)
+            P = np.linalg.inv(np.power.outer(sv, np.arange(pord + 1)))
+            ii = np.arange(1, pord + 2)
+            i1 = ii[:, None] + ii[None, :]
+            H = (1 + (-1.0) ** (i1 - 2)) / (i1 - 1)
+            W1 = P.T @ H @ P
+            hh = h / 2
+            nh = len(hh)
+            ld0 = np.tile(np.diag(W1), nh) * np.repeat(hh, pord + 1)
+            i1v = np.concatenate([np.tile(np.arange(1, pord + 1), nh) + np.repeat(np.arange(nh) * (pord + 1), pord),
+                                  [len(ld0)]])
+            ld = ld0[i1v - 1].copy()
+            i0 = np.arange(1, nh) * pord + 1
+            i2 = np.arange(1, nh) * (pord + 1)
+            ld[i0 - 1] += ld0[i2 - 1]
+            nl = len(ld)
+            A = np.diag(ld)
+            for kk in range(1, pord + 1):
+                diwk = np.diag(W1, kk)
+                vals = np.repeat(hh, pord) * np.tile(np.concatenate([diwk, np.zeros(kk - 1)]), nh)
+                idx = np.arange(nl - kk)
+                A[idx, idx + kk] = vals[idx]
+                A[idx + kk, idx] = vals[idx]
+            R = sl.cholesky(A, lower=False)
+            D1 = R @ D
+        out.append(D1.T @ D1)
+    return out
+
+
 class PSSmooth:
     """``ps`` (and, with ``bspline=True``, mgcv's ``bs``) bases."""
 
@@ -548,6 +618,7 @@ class PSSmooth:
                     raise RError("there should be %d supplied knots" % (nk + 2 * m[0]))
             self.knots = np.asarray(k, dtype=float)
             self.m = [m[0] - 1, m[1]]  # Predict.matrix.Bspline uses m-1
+            self.S = [] if spec.fixed else _bspline_penalties(self.knots, m[0], [m[1]], nk)
             self.X = spline_design(self.knots, x, m[0] + 1, [0])
             self.bs_dim = bs_dim
         else:
@@ -573,6 +644,8 @@ class PSSmooth:
             self.knots = np.asarray(k, dtype=float)
             self.m = m
             self.X = spline_design(self.knots, x, m[0] + 2, [0])
+            Dp = np.diff(np.eye(bs_dim), n=m[1], axis=0) if m[1] > 0 else np.eye(bs_dim)
+            self.S = [] if spec.fixed else [Dp.T @ Dp]
             self.bs_dim = bs_dim
         if (self.X.sum(axis=0) == 0).any():
             warnings.warn("there is *no* information about some basis coefficients")
@@ -626,6 +699,16 @@ class CPSmooth:
         self.m = m
         self.bs_dim = bs_dim
         self.X = _c_spline_des(x, self.knots, m[0] + 2)
+        npc = self.X.shape[1]
+        pord = m[1]
+        De = np.eye(npc + pord)
+        if pord > 0:
+            De = np.diff(De, n=pord, axis=0)
+            Dc = De[:, pord:].copy()
+            Dc[:, npc - pord:] += De[:, :pord]
+        else:
+            Dc = De
+        self.S = [] if spec.fixed else [Dc.T @ Dc]
 
     def predict(self, data):
         x = _num(_getvar(data, self.term[0]))
@@ -646,6 +729,8 @@ class RESmooth:
         self.X = self._design(data, fit=True)
         self.bs_dim = self.X.shape[1]
         self.noterp = True
+        self.S = [np.eye(self.bs_dim)]
+        self.side_constrain = False
 
     def _design(self, data, fit):
         blocks = []
@@ -975,7 +1060,13 @@ class TPSmooth:
         self.bs_dim = k
         self.p_order = m
         nk = 0 if knt is None else knt.shape[0]
-        X, UZ, Xu, mm = self._setup(x, knt if nk >= k else None, m, d, n, k)
+        X, UZ, Xu, mm, S = self._setup(x, knt if nk >= k else None, m, d, n, k)
+        S = (S + S.T) / 2
+        if spec.bs == "ts":
+            w_, V_ = _eig_desc(S)
+            w_[k - M:] = w_[k - M - 1] * 0.1
+            S = (V_ * w_) @ V_.T
+        self.S = [] if spec.fixed else [S]
         self.X = X
         self.UZ = UZ
         self.Xu = Xu
@@ -1028,7 +1119,15 @@ class TPSmooth:
         w = np.sqrt(np.cumsum(X ** 2, axis=0)[-1] / X.shape[0])
         X = X / w
         UZ = UZ / w
-        return X, UZ, Xu, m
+        S0 = E.copy() if pure_knot else np.diag(v)
+        S = _HQmult_post(S0, Z)
+        for kq in range(Z.shape[0]):  # Q'S  (HQmult(S, Z, 1, 1))
+            u = Z[kq]
+            S -= np.outer(u, u @ S)
+        S[:, k - M:] = 0.0
+        S[k - M:, :] = 0.0
+        S = S / w[:, None] / w[None, :]
+        return X, UZ, Xu, m, S
 
     @staticmethod
     def _tps_b(x, Xu, m, d, pw, f):
@@ -1099,6 +1198,24 @@ class TensorSmooth:
                     self.XP[i] = XP
                     Xm[i] = Xm[i] @ XP
         self.X = _tensor_prod(Xm)
+        Sm = []
+        self.S = []
+        if all(getattr(sm, "S", None) is not None and len(sm.S) == 1 for sm in self.margins):
+            for i, sm in enumerate(self.margins):
+                Si = sm.S[0]
+                if self.XP[i] is not None:
+                    Si = self.XP[i].T @ Si @ self.XP[i]
+                Si = Si / np.linalg.eigvalsh(Si).max()
+                Sm.append(Si)
+            dims = [S_.shape[0] for S_ in Sm]
+            for i in range(m):
+                M0 = Sm[0] if i == 0 else np.eye(dims[0])
+                for j in range(1, m):
+                    M0 = np.kron(M0, Sm[j] if i == j else np.eye(dims[j]))
+                if not spec.fx[i]:
+                    self.S.append((M0 + M0.T) / 2)
+        else:
+            self.S = None
         self.C = None
         if inter or any(getattr(sm, "C", None) is not None and np.asarray(sm.C).shape[0] == 0
                         for sm in self.margins if isinstance(sm, _Constructed)):
@@ -1130,6 +1247,7 @@ class _Constructed:
         self.basis = basis
         self.X = basis.X
         self.C = getattr(basis, "C", None)
+        self.S = getattr(basis, "S", None)
 
 
 def smooth_construct(spec: SmoothSpec, data, knots=None) -> _Constructed:
@@ -1169,6 +1287,11 @@ class Smooth:
         self.qrc = qrc
         self.indi = indi
         self.ncons = ncons
+        self.S = None
+        self.dim = len(con.spec.term)
+        self.side_constrain = getattr(con.basis, "side_constrain", True)
+        self.del_index = None
+        self.Xa = None
         self.X = None
 
     @property
@@ -1189,6 +1312,25 @@ def _apply_constraint(X, qrc, indi, j):
         X[:, indi[:nz]] = qrc.qty(X[:, indi].T)[j:nx, :].T
     keep = [c for c in range(k) if c not in set(indi[nz:nx])]
     return X[:, keep]
+
+
+def _constrain_penalty(S, qrc, indi, j):
+    """Z'SZ exactly as smoothCon computes it."""
+    k = S.shape[0]
+    if indi is None:
+        ZSZ = qrc.qty(S)[j:k, :]
+        return qrc.qty(ZSZ.T)[j:k, :].T
+    nx = len(indi)
+    nz = nx - j
+    ZSZ = S.copy()
+    if nz > 0:
+        ZSZ[indi[:nz], :] = qrc.qty(S[indi, :])[j:nx, :]
+    drop = set(indi[nz:nx])
+    keep = [r for r in range(k) if r not in drop]
+    ZSZ = ZSZ[keep, :]
+    if nz > 0:
+        ZSZ[:, indi[:nz]] = qrc.qty(ZSZ[:, indi].T)[j:nx, :].T
+    return ZSZ[:, keep]
 
 
 def smooth_con(spec: SmoothSpec, data, knots=None, absorb_cons=True) -> List[Smooth]:
@@ -1237,9 +1379,18 @@ def smooth_con(spec: SmoothSpec, data, knots=None, absorb_cons=True) -> List[Smo
             qrc = LinpackQR(C.T)
     else:
         j = 0
+    S_list = None
+    if con.S is not None:
+        S_list = [S_.copy() for S_ in con.S]
+        if S_list:
+            maXX = np.abs(X).sum(axis=1).max() ** 2
+            S_list = [S_ / (np.abs(S_).sum(axis=0).max() / maXX) for S_ in S_list]
+        if absorb_cons and j > 0:
+            S_list = [_constrain_penalty(S_, qrc, indi, j) for S_ in S_list]
     for Xi, label, lev in items:
         sm = Smooth(con, label, by, lev, qrc, indi, j)
         sm.X = _apply_constraint(Xi, qrc, indi, j) if absorb_cons else Xi
+        sm.S = None if S_list is None else [S_.copy() for S_ in S_list]
         out.append(sm)
     return out
 
@@ -1262,6 +1413,8 @@ def predict_mat(sm, data) -> np.ndarray:
             Y[~bad] = _apply_constraint(X[~bad], sm.qrc, sm.indi, sm.ncons)
             return Y
         X = _apply_constraint(X, sm.qrc, sm.indi, sm.ncons)
+    if getattr(sm, "del_index", None):
+        X = np.delete(X, sm.del_index, axis=1)
     return X
 
 
@@ -1403,7 +1556,7 @@ def gam_model_matrix(formula, data, knots=None, na_action: Optional[str] = None,
     smooths = []
     for sp in gp.smooth_spec:
         smooths.extend(smooth_con(sp, datad, knots, absorb_cons=True))
-    _check_side(smooths)
+    gam_side(smooths, Xp.to_numpy())
     blocks = [Xp.to_numpy()]
     cols = list(Xp.columns)
     assign = list(Xp.assign)
@@ -1422,14 +1575,154 @@ def gam_model_matrix(formula, data, knots=None, na_action: Optional[str] = None,
     return mm
 
 
-def _check_side(smooths):
-    names = []
+def _mroot(A):
+    """mgcv::mroot(A, rank = ncol(A)) via pivoted Cholesky (LAPACK dpstf2, tol = 0)."""
+    A = np.array(A, dtype=float, copy=True)
+    n = A.shape[0]
+    piv = np.arange(n)
+    work = np.zeros(n)
+    rank = n
+    for j in range(n):
+        diag = np.array([A[i, i] - (A[:j, i] ** 2).sum() for i in range(j, n)])
+        pvt = j + int(np.argmax(diag))
+        ajj = diag[pvt - j]
+        if ajj <= 0.0 or np.isnan(ajj):
+            rank = j
+            break
+        if pvt != j:
+            A[[j, pvt], :] = A[[pvt, j], :]
+            A[:, [j, pvt]] = A[:, [pvt, j]]
+            piv[[j, pvt]] = piv[[pvt, j]]
+        ajj = np.sqrt(ajj)
+        A[j, j] = ajj
+        if j < n - 1:
+            A[j, j + 1:] = (A[j, j + 1:] - A[:j, j] @ A[:j, j + 1:]) / ajj
+    L = np.triu(A)
+    if rank < n:
+        L[rank:, rank:] = 0.0
+    order = np.argsort(piv)
+    return L[:, order].T
+
+
+def _augment_smX(sm, nobs, np_, nc):
+    X = sm.X
+    S = sm.S or []
+    if not S and nc == 0:
+        return np.vstack([X, np.zeros((np_, X.shape[1]))])
+    ind = np.abs(S[0]).mean(axis=0) != 0
+    sqrmaX = np.abs(X[:, ind]).mean() ** 2
+    St = S[0] * (sqrmaX / np.abs(S[0][np.ix_(ind, ind)]).mean())
+    for Si in S[1:]:
+        ind = np.abs(Si).mean(axis=0) != 0
+        St = St + Si * (sqrmaX / np.abs(Si[np.ix_(ind, ind)]).mean())
+    rS = _mroot(St)
+    Xa = np.vstack([X, np.zeros((np_ + nc, X.shape[1]))])
+    Xa[nobs + sm.p_ind, :] = rS.T
+    return Xa
+
+
+def _fix_dependence(X1, X2, tol=DBL_EPS ** 0.5):
+    """mgcv::fixDependence (strict = FALSE): columns of X2 to drop (0-based) or None."""
+    import scipy.linalg as sl
+    n = X1.shape[0]
+    r = X1.shape[1]
+    Q1, R1, _ = sl.qr(X1, mode="economic", pivoting=True)
+    R11 = abs(R1[0, 0])
+    P = X2 - Q1 @ (Q1.T @ X2)  # projection on the orthogonal complement of X1
+    R2, piv = sl.qr(P, mode="r", pivoting=True)
+    nr = min(n - r, X2.shape[1])
+    R2 = R2[:nr, :nr] if R2.shape[0] >= nr else R2
+    rr = r0 = R2.shape[0]
+    while r0 > 0 and np.abs(R2[r0 - 1:rr, r0 - 1:rr]).mean() < R11 * tol:
+        r0 -= 1
+    r0 += 1
+    if r0 > rr:
+        return None
+    return sorted(int(c) for c in piv[r0 - 1:rr])
+
+
+def gam_side(smooths, Xp, tol=DBL_EPS ** 0.5):
+    """Port of mgcv::gam.side (with.pen = TRUE): identifiability side constraints for
+    smooths sharing covariates (e.g. ``s(x) + te(x, z)``).  Modifies ``smooths`` in place."""
+    m = len(smooths)
+    if m == 0:
+        return smooths
+    v_names = []
+    max_dim = 1
     for sm in smooths:
-        vn = [t + (sm.by if sm.by != "NA" else "") + (sm.by_level or "") for t in sm.term]
-        names.extend(vn)
-    if len(names) != len(set(names)):
-        warnings.warn("smooths share covariates: mgcv would apply gam.side() identifiability "
-                      "side-constraints, which statsformula does not implement; columns may differ from R")
+        vn = list(sm.term)
+        if sm.by != "NA":
+            vn = [v + sm.by for v in vn]
+        if sm.by_level is not None:
+            vn = [v + sm.by_level for v in vn]
+        sm.vn = vn
+        v_names.extend(vn)
+        max_dim = max(max_dim, sm.dim)
+    if len(v_names) == len(set(v_names)):
+        return smooths
+    intercept = False
+    if Xp.shape[1]:
+        sds = Xp.std(axis=0, ddof=1) if Xp.shape[0] > 1 else np.zeros(Xp.shape[1])
+        if (sds < DBL_EPS ** 0.75).any():
+            intercept = True
+        else:
+            f = np.ones(Xp.shape[0])
+            coef, *_ = np.linalg.lstsq(Xp, f, rcond=None)
+            if np.abs(Xp @ coef - f).max() < DBL_EPS ** 0.75:
+                intercept = True
+    sm_id = {v: [] for v in dict.fromkeys(v_names)}
+    for d in range(1, max_dim + 1):
+        for i, sm in enumerate(smooths):
+            if sm.dim == d and sm.side_constrain:
+                for j in range(d):
+                    sm_id[sm.vn[j]].append(i)
+    if max_dim == 1:
+        warnings.warn("model has repeated 1-d smooths of same variable.")
+    k = 0
+    for sm in smooths:
+        sm.p_ind = np.arange(k, k + sm.X.shape[1])
+        k += sm.X.shape[1]
+        if sm.S is None:
+            sm._no_pen = True
+    np_ = k
+    nc = 0
+    nobs = smooths[0].X.shape[0]
+
+    def xa(sm):
+        if getattr(sm, "_no_pen", False):
+            raise RError("gam.side() side constraints need the penalty of smooth %s (basis '%s'), "
+                         "which statsformula does not implement" % (sm.label, sm.spec.bs))
+        if sm.Xa is None:
+            sm.Xa = _augment_smX(sm, nobs, np_, nc)
+        return sm.Xa
+
+    for d in range(1, max_dim + 1):
+        for i, sm in enumerate(smooths):
+            if not (sm.dim == d and sm.side_constrain):
+                continue
+            if intercept:
+                X1 = np.zeros((nobs + np_ + nc, 1))
+                X1[:nobs, 0] = 1.0
+            else:
+                X1 = np.zeros((nobs + np_ + nc, 0))
+            comp = []
+            for j in range(d):
+                b = sm_id[sm.vn[j]]
+                kk = b.index(i)
+                for l in range(kk):
+                    if b[l] not in comp:
+                        comp.append(b[l])
+                        X1 = np.hstack([X1, xa(smooths[b[l]])])
+            if X1.shape[1] == int(intercept):
+                ind = None
+            else:
+                ind = _fix_dependence(X1, xa(sm), tol=tol)
+            if ind:
+                sm.X = np.delete(sm.X, ind, axis=1)
+                sm.del_index = (sm.del_index or []) + list(ind)
+    for sm in smooths:
+        sm.Xa = None
+    return smooths
 
 
 # make s(), te(), ti() usable as plain functions inside formulas evaluated outside gam

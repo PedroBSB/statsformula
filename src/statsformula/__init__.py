@@ -27,6 +27,8 @@ from ._api import (ModelMatrix, ModelSpec, SparseModelMatrix, all_names, all_var
                    model_response, model_weights, reformulate, sparse_model_matrix, terms, update)
 from . import _mgcv  # registers s(), te(), ti(), t2()
 from ._mgcv import interpret_gam, smooth_construct, smooth_con, predict_mat, gam_model_matrix, GamSpec
+from ._lavaan import (LavaanSyntaxError, LavaanWarning, lavaan_names, lavaan_parse, lavaan_partable,
+                      lavaanify)
 
 __all__ = [
     "__version__", "RError", "FormulaSyntaxError", "set_collation", "get_collation",
@@ -38,4 +40,6 @@ __all__ = [
     "model_frame", "model_matrix", "model_offset", "model_part", "model_response", "model_weights",
     "reformulate", "sparse_model_matrix", "terms", "update", "interpret_gam", "smooth_construct",
     "GamSpec", "smooth_con", "predict_mat", "gam_model_matrix",
+    "lavaan_parse", "lavaanify", "lavaan_partable", "lavaan_names", "LavaanSyntaxError",
+    "LavaanWarning",
 ]

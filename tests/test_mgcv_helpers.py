@@ -4,6 +4,31 @@ import numpy as np
 import statsformula as sf
 
 
+def run_gampen_case(cs, DATA):
+    from statsformula._mgcv import make_spec, smooth_con
+    from statsformula._eval import EvalContext
+    from statsformula._parser import parse
+    from statsformula._model import model_frame_from_terms
+    spec = make_spec(parse(cs["smooth"]), EvalContext({}, {}))
+    data = DATA[cs["data"]]
+    datad = {c: sf._rtypes.to_r(data[c]) for c in data.columns}
+    return smooth_con(spec, datad, None, absorb_cons=True)
+
+
+def check_gampen_case(sms, r, cs):
+    from test_r_reference import num
+    assert [s.label for s in sms] == [x["label"] for x in r["smooths"]]
+    # "cs": mgcv shrinks the two null-space eigenvalues of the cr penalty to different
+    # values; the null-space basis returned by LAPACK's eigen solver is arbitrary, so
+    # that part of the penalty agrees with R only to ~1e-3 (model matrices are exact).
+    rtol = 2e-3 if '"cs"' in cs["smooth"] else 1e-7
+    for sm, rs in zip(sms, r["smooths"]):
+        assert len(sm.S) == len(rs["S"]), cs["smooth"]
+        for S, RS in zip(sm.S, rs["S"]):
+            RS = np.column_stack([num(c) for c in RS])
+            np.testing.assert_allclose(S, RS, rtol=rtol, atol=rtol * 1e-2 * np.abs(RS).max(), err_msg=cs["smooth"])
+
+
 def run_gam_case(cs, DATA):
     X = sf.gam_model_matrix(cs["formula"], DATA[cs["data"]], knots=cs.get("knots"))
     Xn = X.model_spec.get_model_matrix(DATA[cs["newdata"]]) if cs.get("newdata") else None

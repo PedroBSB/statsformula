@@ -13,3 +13,10 @@ gam_case <- function(cs) {
   }
   res
 }
+
+gampen_case <- function(cs) {
+  d <- getd(cs$data)
+  sml <- smoothCon(eval(parse(text = cs$smooth)), data = d, absorb.cons = TRUE)
+  lapply(sml, function(sm) list(label = sm$label,
+                                S = lapply(sm$S, function(S) lapply(seq_len(ncol(S)), function(j) as.list(unname(S[, j]))))))
+}

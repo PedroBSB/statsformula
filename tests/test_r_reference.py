@@ -28,7 +28,7 @@ ATOL = 1e-10
 
 def case_id(c):
     cs = c[0]
-    return "%s:%s" % (cs["kind"], cs.get("formula") or cs.get("old") or cs.get("labels") or cs.get("parts"))
+    return "%s:%s" % (cs["kind"], cs.get("formula") or cs.get("smooth") or cs.get("old") or cs.get("labels") or cs.get("parts"))
 
 
 def num(values):
@@ -167,6 +167,9 @@ def _run(cs, k):
     if k == "gam":
         import test_mgcv_helpers
         return test_mgcv_helpers.run_gam_case(cs, DATA)
+    if k == "gampen":
+        import test_mgcv_helpers
+        return test_mgcv_helpers.run_gampen_case(cs, DATA)
     raise ValueError(k)
 
 
@@ -250,5 +253,8 @@ def test_against_r(case):
     elif k == "gam":
         import test_mgcv_helpers
         test_mgcv_helpers.check_gam_case(res, r, cs)
+    elif k == "gampen":
+        import test_mgcv_helpers
+        test_mgcv_helpers.check_gampen_case(res, r, cs)
     else:
         raise AssertionError(k)

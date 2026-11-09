@@ -161,8 +161,7 @@ def test_errors_are_r_like(df):
 
 
 def test_gam_dispatch_and_prediction(df):
-    with pytest.warns(UserWarning, match="gam.side"):
-        X = sf.model_matrix("y ~ g + s(x, bs = 'cr', k = 5) + te(x, z, k = 3)", df)
+    X = sf.model_matrix("y ~ g + s(x, bs = 'cr', k = 5) + te(x, z, k = 3)", df)  # gam.side() applied
     assert [c for c in X.columns if c.startswith("s(x)")] == ["s(x).%d" % i for i in range(1, 5)]
     Xn = X.model_spec.get_model_matrix(df.iloc[:4])
     np.testing.assert_allclose(Xn.to_numpy(), X.iloc[:4].to_numpy(), atol=1e-10)
