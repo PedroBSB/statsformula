@@ -49,11 +49,16 @@ Matrix 1.7-3); the fixtures are in `tests/fixtures` and can be regenerated with
 * 400 randomly generated formulas compared with R's `model.matrix()`;
 * penalty matrices of every mgcv model (`G$S`, `G$off`, `G$rank`, smoothing-parameter names) and
   18 penalized GAM fits (`gam(method = "REML" / "GCV.Cp")`, fixed `sp`, weights, `gamma`):
-  smoothing parameters, coefficients, fitted values, predictions, edf and scale;
+  smoothing parameters, coefficients, fitted values, predictions, edf, scale, prediction standard
+  errors (`predict(se.fit = TRUE)`) and the parametric table of `summary.gam` (`p.table`, `r.sq`);
 * 7 SEM models fitted through semopy and pySEM compared with `lavaan::sem()`/`cfa()`
   (`tools/make_sem_fixtures.py`);
 * 8 path models: `lm()` per equation, propagated predictions, and `lavaan::sem()` estimates and
   total effects (`tools/make_path_fixtures.py`);
+* 7 path models for inference (`tools/make_pathse_fixtures.py`): `lavaan::sem()` standard errors,
+  z tests and confidence intervals with `information = "expected"` and `"observed"`, delta-method
+  `:=` indirect/total effects, full-information ML of non-recursive models (feedback loops,
+  a three-variable cycle) and correlated disturbances, and `summary(lm())` t tests;
 * 132 lavaan model strings and 353 option/preset combinations compared with lavaan 0.7.3
   (`tools/make_lavaan_fixtures.py`).
 
@@ -196,11 +201,14 @@ beta = np.linalg.solve(X.T @ X + P, X.T @ y)                                    
 
 b = sf.gam("y ~ g + s(x) + te(x, z)", df, method="REML")   # or "GCV.Cp"; sp=[...] to fix them
 b.sp, b.coefficients, b.edf.sum(), b.scale, b.predict(new)  # same numbers as mgcv
+b.predict(new, se_fit=True)    # columns fit, se_fit: predict.gam(se.fit = TRUE), from b.Vp
+b.summary().p_table            # Estimate, Std. Error, t value, Pr(>|t|) of the parametric terms
 
 tr = FormulaTransformer("~ g + s(x) + s(z)").fit(df)        # in a pipeline
 tr.penalties_, tr.penalty_matrix(sp=[1.0, 3.0])             # aligned with tr.transform() columns
 
 GAMRegressor("cbind(y1, y2) ~ g + s(x) + te(x, z)", method="REML").fit(df).predict(new)
+GAMRegressor("y ~ s(x)").fit(df).predict(new, return_std=True)   # (prediction, standard error)
 GridSearchCV(GAMRegressor("y ~ s(x) + s(z)"), {"sp": [[0.1, 0.1], [1, 1], [10, 10]]})
 ```
 
@@ -208,8 +216,10 @@ The penalized fit minimizes `||y - X b||^2_W + sum_j sp_j b' S_j b`. Smoothing p
 estimated by REML (scale profiled out) or GCV with exact gradients, and match mgcv's to ~1e-3
 on the log scale; when mgcv sends a smoothing parameter to infinity (a smooth reduced to its
 null space), both stop at an arbitrary large value and the fitted values agree to ~1e-5.
-Only the Gaussian family with identity link is fitted; for other models use `penalties_` with
-your own solver.
+Standard errors use mgcv's Bayesian posterior covariance `Vp`; the smooth-term tests of
+`summary.gam` (`s.table`) are not computed. A rank-deficient model (e.g. `y ~ x + s(x)`) raises a
+warning (mgcv sets the unidentifiable coefficients to zero). Only the Gaussian family with
+identity link is fitted; for other models use `penalties_` with your own solver.
 
 ### Path models (multi-line formulas)
 
@@ -228,11 +238,13 @@ model = """
 """
 pm = PathModel(model).fit(df)                      # each equation: lm on its complete cases
 pm.predict(new)        # m, y, y2, y3; downstream equations use the *predicted* m
-pm.coefficients()      # lhs / op / rhs / est, like lavaan::parameterEstimates()
+pm.coefficients()      # lavaan::parameterEstimates(): lhs op rhs est se z pvalue ci.lower ci.upper
 
 pm = PathModel("m ~ x + z\ny ~ m + x").fit(df)
 pm.effects("indirect").loc["y", "x"]               # a * b, as lavaan's  ind := a*b
 pm.effects("total")                                # (I - B)^-1 B
+pm.effects("indirect", se=True)                    # long table with delta-method SEs (lavaan's :=)
+pm.vcov()                                          # covariance of the estimates
 
 PathModel(model, estimator=Ridge())                       # same estimator for every equation
 PathModel(model, estimator={"y": RandomForestRegressor()})  # per response (others: lm)
@@ -240,12 +252,35 @@ PathModel("m ~ x\ny ~ s(m) + s(z)")                       # smooths -> GAMRegres
 GridSearchCV(PathModel(model, estimator=Ridge()), {"estimator__alpha": [0.1, 1, 10]})
 ```
 
+**Feedback loops and correlated disturbances.** Non-recursive models and residual covariances
+(`y1 ~~ y2`) are fitted by full-information maximum likelihood (Fisher scoring from several
+starting values, as `lavaan::sem()` with `fixed.x = TRUE`):
+
+```python
+pm = PathModel("""
+  y1 ~ y2 + x1          # y1 and y2 affect each other
+  y2 ~ y1 + x2 + x3
+  y1 ~~ y2              # correlated disturbances
+""").fit(df)
+pm.estimation_, pm.loglik_      # "ML", log-likelihood
+pm.predict(new)                 # reduced form (I - B)^-1 G x
+pm.effects("total", se=True)    # includes the feedback through the loop
+```
+
+**Inference.** `se="expected"` (default) and `se="observed"` reproduce lavaan's standard errors
+with `information = "expected"` / `"observed"` (z tests, normal confidence intervals at
+`level`); `se="lm"` gives the per-equation t tests of `summary(lm())`. With linear equations,
+recursive models with uncorrelated disturbances are still fitted equation by equation (OLS is
+the ML estimate; `estimation="ML"` forces the joint fit, `"OLS"` the per-equation one). The
+joint fit and the expected information need every endogenous predictor to enter its equation as
+a plain column (`y ~ m + log(x)`, not `y ~ log(m)`) and the equations to share their rows;
+otherwise each equation uses its own observed information (`information_` says which was used).
+Equations with smooths report mgcv's `Vp` standard errors; other estimators get none.
+
 `predict_mode="propagate"` (default) takes only exogenous variables from the data and feeds each
-equation's prediction into the equations downstream (needs a recursive model);
-`predict_mode="direct"` uses the observed predictors. With linear equations the fit equals
-`lavaan::sem()` with observed variables and uncorrelated disturbances
-(`auto.cov.y = FALSE`). Latent variables (`=~`) and covariances (`~~`) are not fitted; parse
-those models with `lavaanify()`.
+equation's prediction into the equations downstream (for non-recursive models: the reduced
+form); `predict_mode="direct"` uses the observed predictors. Latent variables (`=~`) are not
+fitted here; use the SEM backends below or parse those models with `lavaanify()`.
 
 ### SEM backends: semopy, pySEM, pysemforge (`statsformula.sem`)
 

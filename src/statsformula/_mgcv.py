@@ -1573,6 +1573,7 @@ class GamSpec:
         self.columns = columns
         self.env = env
         self.penalties = []
+        self.nsdf = 0  # number of parametric columns (mgcv's G$nsdf)
 
     def get_model_matrix(self, data, output: str = "pandas"):
         import pandas as pd
@@ -1627,6 +1628,7 @@ def gam_model_matrix(formula, data, knots=None, na_action: Optional[str] = None,
     X = np.hstack(blocks)
     spec = GamSpec(gp, pterms, Xp.model_spec, smooths, cols, env)
     spec.penalties = gam_penalties(smooths, Xp.shape[1])
+    spec.nsdf = Xp.shape[1]
     if output == "numpy":
         return X
     mm = ModelMatrix(X, index=mf.index, columns=pd.Index(cols, dtype=object))

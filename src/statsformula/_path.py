@@ -14,8 +14,10 @@ Every line is an ordinary R formula (transformations, factors, interactions,
 ``poly``/``ns``/``bs``, mgcv smooths, ...).  As in lavaan, ``y1 + y2 ~ x`` (and
 ``cbind(y1, y2) ~ x``) define one equation per response, and several lines with the
 same response are merged (``y ~ x1`` and ``y ~ x2`` give ``y ~ x1 + x2``).
-Latent variables (``=~``), covariances (``~~``), defined parameters (``:=``) and
-constraints are not regressions and are rejected.
+Residual covariances between endogenous variables are written as in lavaan,
+``y1 ~~ y2`` (or ``y1 ~~ y2 + y3``); they are returned by :func:`parse_path_system`
+(:func:`parse_path_model` rejects them).  Latent variables (``=~``), defined
+parameters (``:=``) and constraints are not supported.
 """
 
 from __future__ import annotations
@@ -26,12 +28,12 @@ from typing import Dict, List, Optional, Tuple
 from ._parser import Call, Sym, all_vars, deparse, is_call, parse
 from ._rtypes import RError
 
-__all__ = ["PathEquation", "parse_path_model", "path_order"]
+__all__ = ["PathEquation", "parse_path_model", "parse_path_system", "path_order"]
 
 _BINARY_END = re.compile(r"(\+|-|\*|/|:|\^|~|,|\||%in%|\()\s*$")
 _BINARY_START = re.compile(r"^\s*(\+|\*|/|:|\^|\||%in%|,|\))")
-_NOT_REGRESSION = [("=~", "latent variable definitions (=~)"), ("~~", "covariances (~~)"),
-                   (":=", "defined parameters (:=)"), ("<~", "composites (<~)"), ("~*~", "scaling factors (~*~)")]
+_NOT_REGRESSION = [("=~", "latent variable definitions (=~)"), (":=", "defined parameters (:=)"),
+                   ("<~", "composites (<~)"), ("~*~", "scaling factors (~*~)")]
 
 
 class PathEquation:
@@ -132,17 +134,36 @@ def _lhs_names(node) -> Optional[List[str]]:
     return None
 
 
-def parse_path_model(model: str) -> List[PathEquation]:
-    """The equations of a multi-line path model (see the module docstring)."""
+def _cov_terms(rhs: str, st: str) -> List[str]:
+    names = []
+    for part in rhs.split("+"):
+        part = part.strip()
+        if not re.fullmatch(r"[A-Za-z.][A-Za-z0-9._]*|`[^`]+`", part):
+            raise RError("a covariance statement is 'y1 ~~ y2 + y3' with plain variable names: %r" % st)
+        names.append(part.strip("`"))
+    return names
+
+
+def parse_path_system(model: str) -> Tuple[List[PathEquation], List[Tuple[str, str]]]:
+    """The equations and the residual covariances ``(a, b)`` (from ``a ~~ b``) of a
+    multi-line path model."""
     if not isinstance(model, str):
         raise TypeError("a path model is a string with one formula per line")
     order: List[str] = []
     eqs: Dict[str, Tuple[str, List[str]]] = {}
+    covs: List[Tuple[str, str]] = []
     for st in split_statements(model):
+        if "~~" in st:
+            lhs, rhs = st.split("~~", 1)
+            a = _cov_terms(lhs, st)
+            if len(a) != 1:
+                raise RError("a covariance statement has one variable on the left: %r" % st)
+            covs.extend((a[0], b) for b in _cov_terms(rhs, st) if b != a[0])
+            continue
         for op, what in _NOT_REGRESSION:
             if op in st:
-                raise RError("path models contain regressions only; %s are not supported: %r "
-                             "(use statsformula.lavaanify() for full lavaan models)" % (what, st))
+                raise RError("path models contain regressions and residual covariances only; %s are not "
+                             "supported: %r (use statsformula.sem for full lavaan models)" % (what, st))
         node = parse(st)
         if not (is_call(node, "~") and len(node.args) == 2):
             raise RError("each statement of a path model must be a formula 'response ~ predictors': %r" % st)
@@ -165,7 +186,22 @@ def parse_path_model(model: str) -> List[PathEquation]:
         f = parse("%s ~ %s" % (lhs_txt, rhs))
         preds = [v for v in all_vars(f.argv[1])]
         out.append(PathEquation(resp, lhs_txt, rhs, preds))
-    return out
+    endo = set(order)
+    for a, b in covs:
+        bad = [v for v in (a, b) if v not in endo]
+        if bad:
+            raise RError("residual covariances are between endogenous variables (responses); %s is not one "
+                         "(covariances of exogenous variables are taken from the data)" % bad[0])
+    return out, covs
+
+
+def parse_path_model(model: str) -> List[PathEquation]:
+    """The equations of a multi-line path model (see the module docstring)."""
+    eqs, covs = parse_path_system(model)
+    if covs:
+        raise RError("path models contain regressions only here; residual covariances (~~) are supported by "
+                     "parse_path_system() and PathModel")
+    return eqs
 
 
 def path_order(equations: List[PathEquation]) -> Optional[List[int]]:

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.0 (2026-11-09)
+
+* Path-model inference (`PathModel(se=...)`): `coefficients()` now returns lavaan's
+  `parameterEstimates()` columns (`est`, `se`, `z`, `pvalue`, `ci.lower`, `ci.upper`) including
+  residual (co)variances (`~~`) in lavaan's row order; `se="expected"` (default) / `"observed"`
+  match `lavaan::sem(information = ...)`, `se="lm"` matches `summary(lm())`; `vcov()`; `level=`.
+* `effects(kind, se=True)`: direct, indirect and total effects with delta-method standard errors
+  (lavaan's `:=`).
+* Non-recursive path models (feedback loops) and residual covariances (`y1 ~~ y2`) are fitted by
+  full-information maximum likelihood (`estimation="auto"|"ML"|"OLS"`); `predict()` uses the
+  reduced form `(I - B)^-1 G x`. Validated against lavaan 0.7.3 on 7 models (two- and
+  three-variable loops, correlated disturbances, SUR) for both information types.
+* `parse_path_system()`: equations and residual covariances of a path model.
+* GAM standard errors: `GamFit.predict(newdata, se_fit=True)` (`predict.gam(se.fit = TRUE)`),
+  `GamFit.summary()` (`p.table`, `r.sq`, edf per smooth), `GamFit.residual_df`,
+  `GAMRegressor.predict(X, return_std=True)`; validated against mgcv on all 18 GAM fits.
+* `gam()` warns when the penalized design is rank deficient (e.g. `y ~ x + s(x)`).
+* Behaviour change: non-recursive `PathModel`s were fitted by OLS per equation in 0.4; they are
+  now fitted by ML (`estimation="OLS"` restores the old fit).
+
 ## 0.4.0 (2026-11-09)
 
 * Path models: `statsformula.sklearn.PathModel(model, estimator)` fits a system of regressions

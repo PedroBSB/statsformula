@@ -34,5 +34,10 @@ gamfit_case <- function(cs) {
   list(sp = as.list(unname(b$sp)), sp_names = as.list(names(b$sp)), coef = as.list(unname(coef(b))),
        fitted = as.list(unname(fitted(b))), edf = sum(b$edf), scale = b$sig2,
        pred = as.list(unname(predict(b, newdata = getd(cs$newdata)))),
+       se_fit = as.list(unname(predict(b, newdata = getd(cs$newdata), se.fit = TRUE)$se.fit)),
+       ptable = { pt <- summary(b)$p.table
+                  list(names = as.list(rownames(pt)), est = as.list(unname(pt[, 1])), se = as.list(unname(pt[, 2])),
+                       t = as.list(unname(pt[, 3])), p = as.list(unname(pt[, 4]))) },
+       residual_df = length(b$y) - sum(b$edf), r_sq = summary(b)$r.sq,
        criterion = as.numeric(b$gcv.ubre))
 }
