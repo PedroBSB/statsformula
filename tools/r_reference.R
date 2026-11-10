@@ -160,10 +160,25 @@ run_case <- function(cs) {
     return(res)
   }
   if (k == "lm") {
-    fit <- lm(as.formula(cs$formula), data = getd(cs$data))
+    d <- getd(cs$data)
+    fit <- if (is.null(cs$weights)) lm(as.formula(cs$formula), data = d)
+           else { d$.w <- d[[cs$weights]]; lm(as.formula(cs$formula), data = d, weights = .w) }
     cf <- as.matrix(coef(fit))
+    sm <- summary(fit)
+    if (!inherits(sm, "listof")) sm <- list(sm)
+    summ <- lapply(sm, function(s) {
+      ct <- coef(s)
+      list(names = as.list(rownames(ct)), est = as.list(unname(ct[, 1])), se = as.list(unname(ct[, 2])),
+           t = as.list(unname(ct[, 3])), p = as.list(unname(ct[, 4])), sigma = s$sigma,
+           r_squared = s$r.squared, adj_r_squared = s$adj.r.squared,
+           fstatistic = if (is.null(s$fstatistic)) NULL else as.list(unname(s$fstatistic)),
+           df = as.list(unname(s$df)))
+    })
     return(list(coef = lapply(seq_len(ncol(cf)), function(j) as.list(unname(cf[, j]))),
-                rownames = as.list(rownames(cf)), fitted = lapply(seq_len(NCOL(fitted(fit))), function(j) as.list(unname(as.matrix(fitted(fit))[, j])))))
+                rownames = as.list(rownames(cf)), fitted = lapply(seq_len(NCOL(fitted(fit))), function(j) as.list(unname(as.matrix(fitted(fit))[, j]))),
+                summary = summ, printed = as.list(capture.output(print(summary(fit)))),
+                loglik = if (NCOL(fitted(fit)) == 1) as.numeric(logLik(fit)) else NULL,
+                aic = if (NCOL(fitted(fit)) == 1) AIC(fit) else NULL, bic = if (NCOL(fitted(fit)) == 1) BIC(fit) else NULL))
   }
   if (k == "gam") return(gam_case(cs))
   if (k == "gampen") return(list(smooths = gampen_case(cs)))

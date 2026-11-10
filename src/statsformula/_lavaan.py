@@ -2190,7 +2190,7 @@ def _to_frame(pt, pd):
 
 
 def lavaan_parse(model):
-    """Equivalent of ``lavaan::lavParseModelString(model, as.data.frame. = TRUE)``.
+    """Port of lavaan's ``lavParseModelString()`` returning a data frame (lavaan's data-frame form).
 
     Returns a :class:`pandas.DataFrame` with columns ``lhs, op, rhs, block``, the non-empty
     modifier columns among ``efa, fixed, label, start, lower, upper, rv`` and ``mod.idx``.

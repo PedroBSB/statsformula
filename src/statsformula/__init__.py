@@ -30,11 +30,14 @@ from ._mgcv import interpret_gam, smooth_construct, smooth_con, predict_mat, gam
 from ._gamfit import gam, GamFit, fit_penalized
 from ._path import parse_path_model, parse_path_system, PathEquation
 from ._gamfit import GamSummary
+from .datasets import load_data
+from ._summary import EstimatorSummary, LmSummary, MlmSummary, PathSummary, SemSummary
 from ._lavaan import (LavaanSyntaxError, LavaanWarning, lavaan_names, lavaan_parse, lavaan_partable,
                       lavaanify)
 
 __all__ = [
-    "parse_path_model", "parse_path_system", "PathEquation", "GamSummary", "gam", "GamFit", "fit_penalized", "GamPenalty", "penalty_matrix",
+    "parse_path_model", "parse_path_system", "PathEquation", "GamSummary", "LmSummary", "MlmSummary",
+    "EstimatorSummary", "PathSummary", "SemSummary", "load_data", "gam", "GamFit", "fit_penalized", "GamPenalty", "penalty_matrix",
     "__version__", "RError", "FormulaSyntaxError", "set_collation", "get_collation",
     "Factor", "Logical", "Character", "RMatrix", "parse", "Terms", "ContrastMatrix",
     "contr_helmert", "contr_poly", "contr_SAS", "contr_sum", "contr_treatment", "spline_design",

@@ -30,10 +30,11 @@ classifiers = [
 dependencies = ["numpy>=1.22", "pandas>=1.4", "scipy>=1.8"]
 
 [project.optional-dependencies]
-test = ["pytest>=7", "scikit-learn>=1.6", "semopy>=2.3"]
+test = ["pytest>=7", "scikit-learn>=1.6", "semopy>=2.3", "statsmodels>=0.14"]
 sklearn = ["scikit-learn>=1.6"]
 statsmodels = ["statsmodels>=0.13"]
 sem = ["semopy>=2.3"]
+docs = ["sphinx>=7", "furo", "myst-parser>=3", "sphinx-copybutton", "scikit-learn>=1.6", "semopy>=2.3", "statsmodels>=0.14"]
 
 [project.urls]
 Homepage = "https://github.com/PedroBSB/statsformula"
@@ -48,7 +49,7 @@ path = "src/statsformula/_version.py"
 packages = ["src/statsformula"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/statsformula", "tests", "tools", "README.md", "LICENSE", "CHANGELOG.md", "pyproject.toml"]
+include = ["src/statsformula", "tests", "tools", "examples", "README.md", "LICENSE", "CHANGELOG.md", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

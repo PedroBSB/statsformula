@@ -308,13 +308,17 @@ class LinearSystem:
     # -- inference -----------------------------------------------------------------
     def vcov(self, theta, information: str = "expected"):
         info = self.expected_information(theta) if information == "expected" else self.observed_information(theta)
-        ev = np.linalg.eigvalsh(info)
+        # judge singularity on the scale-free (unit diagonal) matrix: variables measured in
+        # very different units make the raw eigenvalues span many orders of magnitude
+        d = np.sqrt(np.abs(np.diag(info)))
+        d[d == 0] = 1.0
+        ev = np.linalg.eigvalsh(info / np.outer(d, d))
         if ev.min() <= ev.max() * 1e-12:
             import warnings
             warnings.warn("the information matrix is singular: the path model is not identified "
                           "(standard errors are not available)", RuntimeWarning, stacklevel=3)
             return np.full_like(info, np.nan)
-        return np.linalg.inv(info)
+        return np.linalg.inv(info / np.outer(d, d)) / np.outer(d, d)
 
     def names(self) -> List[Tuple[str, str, str]]:
         return [(p[3], p[4], p[5]) for p in self.par]
