@@ -40,7 +40,12 @@ res <- lapply(cases, function(cs) {
     out[[inf]] <- list(lhs = col(pe$lhs), op = col(pe$op), rhs = col(pe$rhs), label = col(pe$label),
                        est = col(pe$est), se = col(pe$se), z = col(pe$z), pvalue = col(pe$pvalue),
                        ci.lower = col(pe$ci.lower), ci.upper = col(pe$ci.upper),
-                       converged = lavInspect(fit, "converged"), loglik = as.numeric(logLik(fit)))
+                       converged = lavInspect(fit, "converged"), loglik = as.numeric(logLik(fit)),
+                       fm = as.list(fitMeasures(fit, c("npar", "chisq", "df", "pvalue", "baseline.chisq",
+                              "baseline.df", "baseline.pvalue", "cfi", "tli", "logl", "unrestricted.logl", "aic",
+                              "bic", "bic2", "ntotal", "rmsea", "rmsea.ci.lower", "rmsea.ci.upper", "rmsea.pvalue", "srmr"))),
+                       r2 = as.list(lavInspect(fit, "r2")),
+                       printed = as.list(capture.output(summary(fit, rsquare = TRUE, fit.measures = TRUE))))
   }
   if (isTRUE(cs$lm)) {
     out$lm <- lapply(cs$equations, function(eq) {

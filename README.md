@@ -1,28 +1,570 @@
 # statsformula
 
-**R model formulas for Python — the same terms, columns, names and numbers as R.**
+[![PyPI](https://img.shields.io/pypi/v/statsformula.svg)](https://pypi.org/project/statsformula/)
+[![Python](https://img.shields.io/pypi/pyversions/statsformula.svg)](https://pypi.org/project/statsformula/)
+[![tests](https://github.com/PedroBSB/statsformula/actions/workflows/ci.yml/badge.svg)](https://github.com/PedroBSB/statsformula/actions/workflows/ci.yml)
+[![License: GPL v2+](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
 
-`statsformula` re-implements R's formula machinery (`terms`, `model.frame`,
-`model.matrix`, `update`, ...), the [Formula](https://cran.r-project.org/package=Formula)
-package (multi-part formulas), `Matrix::sparse.model.matrix`, and the model-matrix side of
-[mgcv](https://cran.r-project.org/package=mgcv) (`s()`, `te()`, `ti()` smooths). It is a port of
-R's own algorithms (`termsform` and `modelmatrix` from `stats/src/model.c`, mgcv's `smoothCon`,
-`PredictMat` and thin plate spline code, LINPACK/LAPACK numerics), and it is tested against R.
+**R model formulas for Python: the same terms, columns, names and numbers as R.**
+
+`statsformula` is a port of R's formula machinery (`terms`, `model.frame`, `model.matrix`,
+`update`, ...), the [Formula](https://cran.r-project.org/package=Formula) package (multi-part
+formulas), `Matrix::sparse.model.matrix`, the [mgcv](https://cran.r-project.org/package=mgcv)
+smooths (`s()`, `te()`, `ti()`) and penalized GAM fit, and
+[lavaan](https://lavaan.ugent.be)'s model syntax. It translates R's own algorithms
+(`termsform` and `modelmatrix` from `stats/src/model.c`, mgcv's `smoothCon`, `PredictMat` and
+thin plate spline code, LINPACK/LAPACK numerics) and is tested against R on thousands of cases.
+R is not needed at run time.
+
+* **Design matrices** identical to R's `model.matrix()`: column names, `assign`, `contrasts`,
+  factor coding, `poly()`, `ns()`, `bs()`, mgcv smooths, re-applied to new data.
+* **scikit-learn integration**: formula transformers and estimators that work in `Pipeline`,
+  `cross_val_score` and `GridSearchCV` (the formula itself can be tuned).
+* **R-style summaries**: `summary.lm`, `summary.gam` (with mgcv's smooth-term tests) and
+  lavaan's `summary()`, printed exactly like R.
+* **Models**: Gaussian GAMs fitted like `mgcv::gam(method = "REML")`, path models with feedback
+  loops by full-information ML (as `lavaan::sem()`), SEM through semopy and pySEM.
+
+**Documentation:** the [user guide](docs/guide/) states the estimators and algorithms
+mathematically (REML/GCV, Wood's smooth tests, path-model likelihood and information, fit
+measures). The full site, with the API reference and an examples gallery, is built with Sphinx:
+`pip install -e ".[docs]" && python -m sphinx -b html docs docs/_build/html`.
+
+**Contents:** [Installation](#installation) · [Examples with real data](#examples-with-real-data) ·
+[Why](#why) · [Validation](#validation-against-r) · [Reference](#what-is-supported) ·
+[Limitations](#differences-from-r-and-limitations)
+
+## Installation
+
+```
+pip install statsformula                 # numpy, pandas, scipy
+pip install "statsformula[sklearn]"      # + scikit-learn estimators, pipelines, summaries
+pip install "statsformula[sem]"          # + semopy backend for structural equation models
+pip install statsmodels                  # optional: used by the econometrics examples
+```
+
+Python 3.10 or newer. R is **not** required.
+
+## Examples with real data
+
+Every example uses a dataset that ships with scikit-learn, statsmodels, semopy or statsformula
+itself (`sf.load_data()`), so it runs as-is, without downloads. They cover machine learning,
+econometrics (Greene's *Econometric Analysis*: robust inference, binary choice, panel data,
+SUR, instrumental variables, simultaneous equations) and structural equation models (Bollen). The
+complete scripts are in [`examples/`](examples/), and the test suite runs all of them. The
+outputs shown are the scripts' actual output. The `lm` and lavaan tables are identical to what R
+prints for the same data.
+
+### 1. Design matrices: Fisher's iris data
 
 ```python
 import pandas as pd
+from sklearn.datasets import load_iris
 import statsformula as sf
 
-df = pd.read_csv("data.csv")
+raw = load_iris(as_frame=True)
+iris = raw.frame.drop(columns="target")
+iris.columns = ["Sepal.Length", "Sepal.Width", "Petal.Length", "Petal.Width"]   # R's names
+iris["Species"] = pd.Categorical.from_codes(raw.target, ["setosa", "versicolor", "virginica"])
 
-X = sf.model_matrix("Y ~ C(X1):C(X2) + log(X3)/sqrt(X4) + X5**4", df)
-X.columns          # identical to colnames(model.matrix(...)) in R
-X.assign           # attr(, "assign")
-X.contrasts        # attr(, "contrasts")
+y, X = sf.dmatrices("Sepal.Length ~ Species * Petal.Length + poly(Sepal.Width, 2)", iris)
+list(X.columns)
+# ['(Intercept)', 'Speciesversicolor', 'Speciesvirginica', 'Petal.Length',
+#  'poly(Sepal.Width, 2)1', 'poly(Sepal.Width, 2)2',
+#  'Speciesversicolor:Petal.Length', 'Speciesvirginica:Petal.Length']
+X.assign       # [0, 1, 1, 2, 3, 3, 4, 4]                  attr(, "assign") in R
+X.contrasts    # {'Species': 'contr.treatment'}
 
-sf.formula("Y~C(X1):C(X2)+log(X3)/sqrt(X4)+X5**4")
-# <formula: Y ~ C(X1):C(X2) + log(X3)/sqrt(X4) + X5^4>     (R prints exactly this)
+# the fitted design (factor levels, orthogonal polynomial coefficients) is reused on new data
+new = pd.DataFrame({"Species": ["virginica", "setosa"], "Petal.Length": [5.1, 1.4],
+                    "Sepal.Width": [3.0, 3.5]})
+X.model_spec.get_model_matrix(new)
 ```
+
+### 2. `summary(lm())` in Python
+
+```python
+from sklearn.linear_model import LinearRegression
+from statsformula.sklearn import FormulaEstimator
+
+model = FormulaEstimator("Sepal.Length ~ Petal.Length * Species", LinearRegression(fit_intercept=False))
+print(model.fit(iris).summary())
+```
+
+```
+Residuals:
+     Min       1Q   Median       3Q      Max 
+-0.73479 -0.22785 -0.03132  0.24375  0.93608 
+
+Coefficients:
+                               Estimate Std. Error t value Pr(>|t|)    
+(Intercept)                      4.2132     0.4074  10.341  < 2e-16 ***
+Petal.Length                     0.5423     0.2768   1.959  0.05200 .  
+Speciesversicolor               -1.8056     0.5984  -3.017  0.00302 ** 
+Speciesvirginica                -3.1535     0.6341  -4.973 1.85e-06 ***
+Petal.Length:Speciesversicolor   0.2860     0.2951   0.969  0.33405    
+Petal.Length:Speciesvirginica    0.4534     0.2901   1.563  0.12029    
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+Residual standard error: 0.3365 on 144 degrees of freedom
+Multiple R-squared:  0.8405,	Adjusted R-squared:  0.8349 
+F-statistic: 151.7 on 5 and 144 DF,  p-value: < 2.2e-16
+```
+
+The same table is available as data: `s.coefficients` (a DataFrame), `s.sigma`, `s.r_squared`,
+`s.adj_r_squared`, `s.fstatistic`, `s.aic` and `s.bic`.
+
+### 3. scikit-learn pipelines: diabetes progression
+
+The diabetes data of Efron et al. (2004): 442 patients, ten baseline measurements, and disease
+progression one year later.
+
+```python
+import numpy as np, pandas as pd
+from sklearn.datasets import load_diabetes
+from sklearn.linear_model import Ridge, RidgeCV
+from sklearn.model_selection import GridSearchCV, KFold, cross_val_score, train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from statsformula.sklearn import FormulaEstimator, FormulaTransformer
+
+df = load_diabetes(scaled=False, as_frame=True).frame
+df.columns = ["age", "sex", "bmi", "bp", "tc", "ldl", "hdl", "tch", "ltg", "glu", "progression"]
+df["sex"] = pd.Categorical(df["sex"].astype(int).astype(str))
+train, test = train_test_split(df, test_size=0.25, random_state=0)
+cv = KFold(5, shuffle=True, random_state=0)
+
+# (a) the formula as the first step of a pipeline
+pipe = make_pipeline(
+    FormulaTransformer("~ sex + age + ns(bmi, 3) + bp + log(ltg) + hdl + poly(glu, 2)",
+                       remove_intercept=True),
+    StandardScaler(),
+    RidgeCV(alphas=np.logspace(-3, 3, 13)),
+)
+cross_val_score(pipe, train, train["progression"], cv=cv).mean()     # 0.526
+pipe.fit(train, train["progression"])
+pipe[0].get_feature_names_out()
+# ['sex2', 'age', 'ns(bmi, 3)1', 'ns(bmi, 3)2', 'ns(bmi, 3)3', 'bp', 'log(ltg)', 'hdl',
+#  'poly(glu, 2)1', 'poly(glu, 2)2']
+
+# (b) the formula as a hyper-parameter: FormulaEstimator builds y and X from it
+search = GridSearchCV(
+    FormulaEstimator(estimator=Ridge()),
+    {"formula": ["progression ~ bmi + bp + ltg",
+                 "progression ~ sex + age + bmi + bp + ltg + hdl + glu",
+                 "progression ~ sex + age + ns(bmi, 3) + bp + log(ltg) + hdl + poly(glu, 2)",
+                 "progression ~ (sex + bmi + bp + ltg)^2 + hdl"],
+     "estimator__alpha": [0.01, 0.1, 1.0, 10.0]},
+    cv=cv,
+).fit(train)
+search.best_params_
+# {'estimator__alpha': 0.01, 'formula': 'progression ~ (sex + bmi + bp + ltg)^2 + hdl'}
+```
+
+| formula | best alpha | mean CV R² |
+|---|---:|---:|
+| `progression ~ (sex + bmi + bp + ltg)^2 + hdl` | 0.01 | 0.533 |
+| `progression ~ sex + age + ns(bmi, 3) + bp + log(ltg) + hdl + poly(glu, 2)` | 0.1 | 0.529 |
+| `progression ~ sex + age + bmi + bp + ltg + hdl + glu` | 1 | 0.523 |
+| `progression ~ bmi + bp + ltg` | 1 | 0.505 |
+
+All data-dependent transformations (factor levels, `ns()` knots, `poly()` coefficients, `log`)
+are learned on each training fold and re-applied to the held-out fold, so cross-validation
+does not leak information.
+
+### 4. Classification: Wisconsin breast cancer
+
+```python
+from sklearn.datasets import load_breast_cancer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+
+raw = load_breast_cancer(as_frame=True)
+bc = raw.frame.drop(columns="target")
+bc.columns = [c.replace(" ", "_") for c in bc.columns]
+bc["diagnosis"] = pd.Categorical.from_codes(raw.target, list(raw.target_names))
+
+clf = FormulaEstimator(
+    "diagnosis ~ log(mean_area) + mean_concave_points * mean_texture + worst_smoothness",
+    LogisticRegression(C=10.0, max_iter=5000), remove_intercept=True)
+cv = StratifiedKFold(5, shuffle=True, random_state=0)
+cross_val_score(clf, bc, bc["diagnosis"], cv=cv, scoring="roc_auc").mean()   # 0.986
+clf.fit(bc).classes_                       # ['benign', 'malignant']
+clf.predict_proba(bc.head(3))
+```
+
+A factor response is passed to the classifier as its labels. `y_encoding=` selects integer
+codes or one-hot columns instead.
+
+### 5. Generalized additive models (mgcv)
+
+```python
+b = sf.gam("progression ~ sex + s(age) + s(bmi) + s(bp) + s(ltg) + s(hdl)", df, method="REML")
+print(b.summary())
+```
+
+```
+Family: gaussian 
+Link function: identity 
+
+Formula:
+progression ~ sex + s(age) + s(bmi) + s(bp) + s(ltg) + s(hdl)
+
+Parametric coefficients:
+            Estimate Std. Error t value Pr(>|t|)    
+(Intercept)  163.140      3.709  43.987  < 2e-16 ***
+sex2         -23.502      5.788  -4.061 5.82e-05 ***
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+Approximate significance of smooth terms:
+         edf Ref.df     F  p-value    
+s(age) 2.878  3.622  1.98    0.104    
+s(bmi) 2.476  3.152 21.81  < 2e-16 ***
+s(bp)  1.282  1.514 20.03 3.62e-06 ***
+s(ltg) 3.306  4.163 15.16  < 2e-16 ***
+s(hdl) 1.000  1.000 18.98 1.70e-05 ***
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+R-sq.(adj) =  0.523   Deviance explained = 53.6%
+-REML = 2371.4  Scale est. = 2832.3    n = 442
+```
+
+These are mgcv's numbers: smoothing parameters, coefficients, `Vp` standard errors and Wood's
+smooth-term tests. The one visible difference from `mgcv::gam` on this model is the edf of
+`s(hdl)`: 1.000 here, 1.004 in mgcv. Its REML-optimal smoothing parameter is infinite (the
+effect is linear), and mgcv stops slightly before reaching it. Predictions with standard errors,
+and the same model as a scikit-learn estimator:
+
+```python
+new_patients = pd.DataFrame({"sex": ["1", "2"], "age": [50, 50], "bmi": [22.0, 32.0],
+                             "bp": [90, 105], "ltg": [4.4, 5.0], "hdl": [55, 40]})
+b.predict(new_patients, se_fit=True)
+#       fit  se_fit
+# 0  111.84    6.16                     predict.gam(se.fit = TRUE)
+# 1  209.80    6.77
+
+from statsformula.sklearn import GAMRegressor
+gam = GAMRegressor("progression ~ sex + s(age) + s(bmi) + s(bp) + s(ltg) + s(hdl)")
+cross_val_score(gam, df, cv=KFold(5, shuffle=True, random_state=0)).mean()   # 0.497 (linear: 0.488)
+```
+
+### 6. Path analysis: does BMI act through triglycerides?
+
+```python
+from statsformula.sklearn import PathModel
+
+df["sex"] = (df["sex"] == "2").astype(float)
+pm = PathModel("""
+  ltg         ~ bmi + age + sex          # mediator: log serum triglycerides
+  progression ~ ltg + bmi + bp           # outcome
+""").fit(df)
+print(pm.summary(effects=True))          # lavaan's summary(fit, fit.measures = TRUE, rsquare = TRUE)
+```
+
+```
+Regressions:
+                   Estimate  Std.Err  z-value  P(>|z|)
+  ltg ~                                               
+    bmi               0.048    0.005    9.604    0.000
+    age               0.007    0.002    4.250    0.000
+    sex               0.086    0.044    1.963    0.050
+  progression ~                                       
+    ltg              49.577    5.673    8.739    0.000
+    bmi               6.500    0.709    9.171    0.000
+    bp                0.903    0.209    4.325    0.000
+
+Intercepts:
+                   Estimate  Std.Err  z-value  P(>|z|)
+   .ltg               2.986    0.143   20.906    0.000
+   .progression    -334.881   26.946  -12.428    0.000
+
+Variances:
+                   Estimate  Std.Err  z-value  P(>|z|)
+   .ltg               0.206    0.014   14.866    0.000
+   .progression    3083.051  207.388   14.866    0.000
+
+R-Square:
+                   Estimate
+    ltg               0.242
+    progression       0.471
+
+Indirect Effects:
+                        Estimate  Std.Err  z-value  P(>|z|)
+    progression <- bmi     2.376    0.368    6.464    0.000
+    progression <- age     0.358    0.094    3.822    0.000
+    progression <- sex     4.286    2.238    1.915    0.055
+```
+
+The fit measures above the parameter table (chi-square 24.686 on 3 df, CFI 0.949, TLI 0.848,
+RMSEA 0.128, SRMR 0.035, AIC 5381.888) are those of `lavaan::sem()` on the same data, and are
+also returned by `pm.fit_measures()`. Models with feedback loops (`y1 ~ y2` and `y2 ~ y1`) and
+correlated disturbances (`y1 ~~ y2`) are fitted by full-information maximum likelihood.
+
+### 7. Confirmatory factor analysis: Holzinger & Swineford (1939)
+
+```python
+from semopy.examples import holzinger39
+from statsformula.sem import fit_semopy
+
+fit = fit_semopy("""
+  visual  =~ x1 + x2 + x3
+  textual =~ x4 + x5 + x6
+  speed   =~ x7 + x8 + x9
+""", holzinger39.get_data())
+print(fit.summary())
+```
+
+```
+SEM fitted with semopy (lavaan parameter table)
+
+  Number of model parameters                        21
+
+  Number of observations                           301
+
+Model Test User Model:
+
+  Test statistic                                85.306
+  Degrees of freedom                                24
+  P-value (Chi-square)                           0.000
+
+Model Test Baseline Model:
+
+  Test statistic                               918.852
+  Degrees of freedom                                36
+
+User Model versus Baseline Model:
+
+  Comparative Fit Index (CFI)                    0.931
+  Tucker-Lewis Index (TLI)                       0.896
+...
+Latent Variables:
+                   Estimate  Std.Err  z-value  P(>|z|)
+  visual =~                                           
+    x1                1.000       NA       NA       NA
+    x2                0.554    0.100    5.554    0.000
+    x3                0.729    0.109    6.685    0.000
+  textual =~                                          
+    x4                1.000       NA       NA       NA
+    x5                1.113    0.065   17.014    0.000
+    x6                0.926    0.055   16.703    0.000
+  speed =~                                            
+    x7                1.000       NA       NA       NA
+    x8                1.180    0.165    7.152    0.000
+    x9                1.082    0.151    7.155    0.000
+...
+```
+
+The model is expanded by `lavaanify()` into lavaan's own parameter table and fitted by semopy.
+The estimates agree with `lavaan::cfa()` to about 2e-5 (lavaan: chi-square 85.306 on 24 df).
+
+### 8. Econometrics: heteroskedasticity-robust inference (Greene)
+
+Greene's credit card expenditure data (72 cardholders, bundled with statsmodels): OLS with
+R's `summary(lm())`, White standard errors and the Breusch-Pagan test from statsmodels on
+statsformula's design matrices, and weighted least squares.
+
+```python
+import statsmodels.api as sm
+from statsmodels.stats.diagnostic import het_breuschpagan
+
+cc = sm.datasets.ccard.load_pandas().data
+formula = "AVGEXP ~ AGE + OWNRENT + INCOME + I(INCOME^2)"
+ols = FormulaEstimator(formula, LinearRegression(fit_intercept=False)).fit(cc)
+ols.summary().coefficients          # Greene: -237.15, -3.0818, 27.941, 234.35, -14.997
+
+y, X = sf.dmatrices(formula, cc)
+fit = sm.OLS(y, X).fit()
+fit.get_robustcov_results("HC0").bse          # White (1980) standard errors
+het_breuschpagan(fit.resid, X)[:2]            # LM statistic, p-value
+
+wls = FormulaEstimator(formula, LinearRegression(fit_intercept=False))
+wls.fit(cc, sample_weight=1 / cc["INCOME"] ** 2).summary()     # weighted summary(lm())
+```
+
+|  | OLS se | White (HC0) se | HC3 se |
+|---|---:|---:|---:|
+| (Intercept) | 199.352 | 212.991 | 229.574 |
+| AGE | 5.515 | 3.302 | 3.605 |
+| OWNRENT | 82.922 | 92.188 | 99.314 |
+| INCOME | 80.366 | 88.866 | 95.482 |
+| I(INCOME^2) | 7.469 | 6.945 | 7.476 |
+
+### 9. Binary choice: probit and logit (Greene, Spector & Mazzeo)
+
+```python
+sp = sm.datasets.spector.load_pandas().data            # GPA, TUCE, PSI, GRADE (32 students)
+y, X = sf.dmatrices("GRADE ~ GPA + TUCE + PSI", sp)
+probit = sm.Probit(y, X).fit(disp=False)
+probit.params                     # Greene: -7.452, 1.626, 0.052, 1.426
+probit.get_margeff(at="mean").summary_frame()        # marginal effect of PSI: 0.468
+```
+
+|  | probit | se | logit | se |
+|---|---:|---:|---:|---:|
+| (Intercept) | -7.4523 | 2.5425 | -13.0213 | 4.9313 |
+| GPA | 1.6258 | 0.6939 | 2.8261 | 1.2629 |
+| TUCE | 0.0517 | 0.0839 | 0.0952 | 0.1416 |
+| PSI | 1.4263 | 0.5950 | 2.3787 | 1.0646 |
+
+### 10. Numerical accuracy: Longley and NIST's certified results
+
+The Longley (1967) data are nearly collinear, and NIST uses them as a benchmark for linear
+least squares. statsformula's `summary(lm())` uses R's LINPACK QR and reproduces the certified
+values:
+
+```python
+lo = sm.datasets.longley.load_pandas().data
+s = FormulaEstimator("TOTEMP ~ GNPDEFL + GNP + UNEMP + ARMED + POP + YEAR",
+                     LinearRegression(fit_intercept=False)).fit(lo).summary()
+s.sigma, s.r_squared              # 304.854073561964, 0.995479004577296  (NIST: ...565, ...296)
+```
+
+The largest relative error against NIST's 15-digit certified estimates and standard errors is
+1.1e-13 (see [`examples/10_longley_nist.py`](examples/10_longley_nist.py)).
+
+### 11. Panel data and seemingly unrelated regressions (Greene, Grunfeld)
+
+Greene's five-firm version of Grunfeld's investment data ships with statsformula
+(`sf.load_data("grunfeld_greene")`, Table F13.1). Fixed effects are least squares with firm
+dummies. Zellner's SUR is a `PathModel` with correlated disturbances, fitted by maximum
+likelihood:
+
+```python
+g = sf.load_data("grunfeld_greene")
+lsdv = lambda f: FormulaEstimator(f, LinearRegression(fit_intercept=False)).fit(g).summary()
+lsdv("invest ~ value + capital").coefficients               # pooled OLS
+lsdv("invest ~ value + capital + firm").coefficients        # firm fixed effects (plm "within")
+lsdv("invest ~ value + capital + firm + factor(year)")      # two-way fixed effects
+
+abbr = {"General Motors": "GM", "Chrysler": "CH", "General Electric": "GE",
+        "Westinghouse": "WE", "US Steel": "US"}
+wide = g.assign(firm=g.firm.map(abbr)).pivot(index="year", columns="firm",
+                                             values=["invest", "value", "capital"])
+wide.columns = ["%s_%s" % c for c in wide.columns]
+f = list(abbr.values())
+sur = PathModel("\n".join(
+    ["invest_{0} ~ value_{0} + capital_{0}".format(a) for a in f] +
+    ["invest_%s ~~ %s" % (a, " + ".join("invest_" + b for b in f[i + 1:]))
+     for i, a in enumerate(f[:-1])])).fit(wide)
+sur.fit_measures()["logl"]        # -459.092, as lavaan::sem() on the same system
+```
+
+| | pooled OLS | firm fixed effects | two-way fixed effects |
+|---|---:|---:|---:|
+| value | 0.1051 (0.0114) | 0.1060 (0.0159) | 0.1260 (0.0232) |
+| capital | 0.3054 (0.0435) | 0.3467 (0.0242) | 0.3618 (0.0360) |
+| residual SE | 127.26 | 69.12 | 70.12 |
+
+The F test of equal firm intercepts is F(4, 93) = 58.96. The likelihood-ratio test of a
+diagonal disturbance covariance (SUR vs. equation-by-equation OLS) is 44.76 on 10 df.
+
+### 12. Structural equation model: Bollen's Political Democracy
+
+Bollen (1989, ch. 8): industrialization in 1960 and democracy in 1960 and 1965 in 75
+countries, with correlated errors for the same indicator over time. This is the standard
+lavaan example.
+
+```python
+from semopy.examples import political_democracy
+
+fit = fit_semopy("""
+  ind60 =~ x1 + x2 + x3
+  dem60 =~ y1 + y2 + y3 + y4
+  dem65 =~ y5 + y6 + y7 + y8
+  dem60 ~ ind60
+  dem65 ~ ind60 + dem60
+  y1 ~~ y5
+  y2 ~~ y4 + y6
+  y3 ~~ y7
+  y4 ~~ y8
+  y6 ~~ y8
+""", political_democracy.get_data())
+print(fit.summary())
+```
+
+```
+Model Test User Model:
+
+  Test statistic                                38.125
+  Degrees of freedom                                35
+  P-value (Chi-square)                           0.329
+...
+Regressions:
+                   Estimate  Std.Err  z-value  P(>|z|)
+  dem60 ~                                             
+    ind60             1.483    0.399    3.715    0.000
+  dem65 ~                                             
+    ind60             0.572    0.221    2.586    0.010
+    dem60             0.837    0.098    8.514    0.000
+```
+
+The chi-square statistic, degrees of freedom and estimates are lavaan's. With loadings
+constrained equal over time (`dem60 =~ y1 + a*y2 + b*y3 + c*y4`, the same labels in `dem65`)
+the statistic rises to 40.179 on 38 df, so the difference test is 2.054 on 3 df. The indirect
+effect `ind60 -> dem60 -> dem65` (`indirect := g1*b2`) is 1.273.
+
+### 13. Instrumental variables and simultaneous equations (Kmenta; Klein's Model I)
+
+An IV model is a two-part formula, as in R's `ivreg(y ~ regressors | instruments)`.
+`sf.model_matrix(F, data, rhs=1)` is the regressor matrix and `rhs=2` the instrument matrix.
+Kmenta's food-market data and Klein's Model I ship with statsformula.
+
+```python
+from statsmodels.sandbox.regression.gmm import IV2SLS
+
+kmenta = sf.load_data("kmenta")
+F = sf.Formula("consump ~ price + income | income + farmPrice + trend")   # demand equation
+y = np.asarray(sf.model_part(F, sf.model_frame(F, kmenta), lhs=1)).ravel()
+X, Z = sf.model_matrix(F, kmenta, rhs=1), sf.model_matrix(F, kmenta, rhs=2)
+iv = IV2SLS(y, X, Z).fit()
+iv.params            # 94.6333, -0.2436, 0.3140   (Kmenta 1986; OLS price slope: -0.3163)
+
+# price and quantity determined jointly: the non-recursive system by full-information ML
+fiml = PathModel("""
+  consump ~ price + income                 # demand
+  price   ~ consump + farmPrice + trend    # supply, normalized on price
+  consump ~~ price
+""").fit(kmenta)
+fiml.coefficients().head(2)                # demand price slope -0.2295 (se 0.0900), as lavaan
+```
+
+| Klein's Model I, 2SLS (Greene) | | OLS | 2SLS | 2SLS se |
+|---|---|---:|---:|---:|
+| consumption | profits | 0.1929 | 0.0173 | 0.1312 |
+| | lagged profits | 0.0899 | 0.2162 | 0.1192 |
+| | wages | 0.7962 | 0.8102 | 0.0447 |
+| investment | profits | 0.4796 | 0.1502 | 0.1925 |
+| | lagged profits | 0.3330 | 0.6159 | 0.1809 |
+| | lagged capital | -0.1118 | -0.1578 | 0.0402 |
+| private wages | private output | 0.4395 | 0.4389 | 0.0396 |
+| | lagged output | 0.1461 | 0.1467 | 0.0432 |
+| | trend | 0.1302 | 0.1304 | 0.0324 |
+
+The full script ([`examples/13_instrumental_variables.py`](examples/13_instrumental_variables.py))
+adds the first-stage F test (88.9), the Durbin-Wu-Hausman test of endogeneity (t = -3.38,
+p = 0.004) and the supply equation.
+
+### Datasets
+
+Datasets that are not available in another Python package ship with statsformula:
+
+```python
+sf.load_data()                     # catalogue: name, title, rows, columns, source
+k = sf.load_data("kmenta")         # pandas DataFrame; k.attrs["description"], k.attrs["source"]
+```
+
+| name | data | source |
+|---|---|---|
+| `kmenta` | supply and demand for food, 20 years | Kmenta (1986), *Elements of Econometrics*, Table 13-1 |
+| `klein` | Klein's Model I, US 1920-1941 | Greene (2003), *Econometric Analysis*, Table F15.1 |
+| `grunfeld_greene` | investment of 5 US firms, 1935-1954 | Greene (2003), *Econometric Analysis*, Table F13.1 |
+
+The other examples use data from scikit-learn (`load_iris`, `load_diabetes`,
+`load_breast_cancer`), statsmodels (`ccard`, `spector`, `longley`) and semopy
+(`holzinger39`, `political_democracy`).
 
 ## Why
 
@@ -50,7 +592,13 @@ Matrix 1.7-3); the fixtures are in `tests/fixtures` and can be regenerated with
 * penalty matrices of every mgcv model (`G$S`, `G$off`, `G$rank`, smoothing-parameter names) and
   18 penalized GAM fits (`gam(method = "REML" / "GCV.Cp")`, fixed `sp`, weights, `gamma`):
   smoothing parameters, coefficients, fitted values, predictions, edf, scale, prediction standard
-  errors (`predict(se.fit = TRUE)`) and the parametric table of `summary.gam` (`p.table`, `r.sq`);
+  errors (`predict(se.fit = TRUE)`) and `summary.gam`: `p.table`, `s.table` (Wood's smooth-term
+  tests, including the random-effect test of `re`/`cs`/`cc` smooths), `pTerms.table`, `edf1`,
+  `r.sq`, deviance explained and the printed output;
+* `summary.lm` of 12 linear models (multi-response, weighted, rank deficient, intercept only,
+  no intercept, few residual degrees of freedom): coefficient table, sigma, R^2, F test,
+  `logLik`/`AIC`/`BIC` and the printed output; mgcv's Davies algorithm (`psum.chisq`) on 60 cases,
+  R's `format()`, `format.pval()` and `printCoefmat()` (`tools/make_summary_fixtures.py`);
 * 7 SEM models fitted through semopy and pySEM compared with `lavaan::sem()`/`cfa()`
   (`tools/make_sem_fixtures.py`);
 * 8 path models: `lm()` per equation, propagated predictions, and `lavaan::sem()` estimates and
@@ -58,19 +606,14 @@ Matrix 1.7-3); the fixtures are in `tests/fixtures` and can be regenerated with
 * 7 path models for inference (`tools/make_pathse_fixtures.py`): `lavaan::sem()` standard errors,
   z tests and confidence intervals with `information = "expected"` and `"observed"`, delta-method
   `:=` indirect/total effects, full-information ML of non-recursive models (feedback loops,
-  a three-variable cycle) and correlated disturbances, and `summary(lm())` t tests;
+  a three-variable cycle) and correlated disturbances, `summary(lm())` t tests, 20
+  `fitMeasures()` (chi-square, baseline, CFI, TLI, log-likelihoods, AIC, BIC, SABIC, RMSEA with its
+  confidence interval and tests, SRMR), `lavInspect(fit, "r2")` and the printed parameter tables
+  of `summary()`;
 * 132 lavaan model strings and 353 option/preset combinations compared with lavaan 0.7.3
   (`tools/make_lavaan_fixtures.py`).
 
 Numbers agree to ~1e-12 relative error; names, orderings and attributes are identical.
-
-## Installation
-
-```
-pip install statsformula
-```
-
-Requires Python ≥ 3.10, numpy, pandas and scipy. R is **not** needed.
 
 ## What is supported
 
@@ -202,7 +745,7 @@ beta = np.linalg.solve(X.T @ X + P, X.T @ y)                                    
 b = sf.gam("y ~ g + s(x) + te(x, z)", df, method="REML")   # or "GCV.Cp"; sp=[...] to fix them
 b.sp, b.coefficients, b.edf.sum(), b.scale, b.predict(new)  # same numbers as mgcv
 b.predict(new, se_fit=True)    # columns fit, se_fit: predict.gam(se.fit = TRUE), from b.Vp
-b.summary().p_table            # Estimate, Std. Error, t value, Pr(>|t|) of the parametric terms
+print(b.summary())             # summary.gam, printed like R (p.table, s.table, R-sq., -REML, ...)
 
 tr = FormulaTransformer("~ g + s(x) + s(z)").fit(df)        # in a pipeline
 tr.penalties_, tr.penalty_matrix(sp=[1.0, 3.0])             # aligned with tr.transform() columns
@@ -216,8 +759,7 @@ The penalized fit minimizes `||y - X b||^2_W + sum_j sp_j b' S_j b`. Smoothing p
 estimated by REML (scale profiled out) or GCV with exact gradients, and match mgcv's to ~1e-3
 on the log scale; when mgcv sends a smoothing parameter to infinity (a smooth reduced to its
 null space), both stop at an arbitrary large value and the fitted values agree to ~1e-5.
-Standard errors use mgcv's Bayesian posterior covariance `Vp`; the smooth-term tests of
-`summary.gam` (`s.table`) are not computed. A rank-deficient model (e.g. `y ~ x + s(x)`) raises a
+Standard errors use mgcv's Bayesian posterior covariance `Vp`. A rank-deficient model (e.g. `y ~ x + s(x)`) raises a
 warning (mgcv sets the unidentifiable coefficients to zero). Only the Gaussian family with
 identity link is fitted; for other models use `penalties_` with your own solver.
 
@@ -327,6 +869,43 @@ factor, MIMIC with factor and `log()` covariates, Political Democracy with indir
 effects, latent and observed path models with R expressions). semopy matches to about 2e-5
 and pySEM to about 5e-5. The exception is one model where two covariates correlate at 0.999,
 where pySEM matches only to about 1e-2.
+
+### Model summaries (R and lavaan style)
+
+Every fitted model has a `summary()` that prints like its R counterpart and keeps its tables as
+DataFrames:
+
+```python
+from sklearn.linear_model import LinearRegression, Ridge
+
+s = FormulaEstimator("y ~ log(x) + f", LinearRegression(fit_intercept=False)).fit(df).summary()
+print(s)                     # summary(lm(y ~ log(x) + f, df)): residuals, coefficients with
+                             # t tests and stars, residual SE, R-squared, F-statistic
+s.coefficients, s.sigma, s.r_squared, s.adj_r_squared, s.fstatistic, s.f_pvalue, s.aic, s.bic
+FormulaEstimator("cbind(y1, y2) ~ x", LinearRegression()).fit(df).summary()   # one per response
+FormulaEstimator("y ~ x", Ridge()).fit(df).summary()     # other estimators: coefficients, score
+
+g = sf.gam("y ~ f + s(x) + te(x, z)", df).summary()     # or GAMRegressor(...).fit(df).summary()
+print(g)                     # summary.gam: Parametric coefficients, Approximate significance of
+                             # smooth terms (edf, Ref.df, F, p-value), R-sq.(adj), deviance, -REML
+g.p_table, g.s_table, g.pterms_table, g.r_sq, g.dev_expl
+
+pm = PathModel("y1 ~ y2 + x1\ny2 ~ y1 + x2 + x3\ny1 ~~ y2").fit(df)
+print(pm.summary())          # lavaan's summary(fit, fit.measures = TRUE, rsquare = TRUE)
+pm.fit_measures()            # lavaan's fitMeasures(): chisq, df, pvalue, cfi, tli, logl, aic, bic,
+                             # rmsea (+ CI, tests), srmr, ...
+pm.rsquare()                 # lavInspect(fit, "r2")
+pm.summary(effects=True)     # adds indirect and total effects with delta-method SEs
+
+print(fit_semopy(model, df).summary())   # SEM backends: lavaan layout, semopy's SEs and fit stats
+```
+
+`summary.lm` uses `lm`'s pivoted QR, so aliased columns show as `NA` exactly as in R (scikit-learn's
+`LinearRegression` returns a minimum-norm solution instead). The smooth-term p-values are Wood's
+(2013) tests as computed by mgcv (`testStat`, and `reTest` for smooths without a penalty null
+space), with Davies' algorithm for the distribution of the test statistic. Path-model fit
+measures need the model as one linear system on shared rows (linear equations); equations with
+smooths show mgcv's smooth-term table instead of their basis coefficients.
 
 ### lavaan model syntax (structural equation models)
 

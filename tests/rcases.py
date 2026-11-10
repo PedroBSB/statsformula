@@ -299,7 +299,11 @@ ALL_CASES = ALL_CASES + GAM
 LM = [{"kind": "lm", "formula": f, "data": "d2"} for f in [
     "y ~ log(x) + f", "cbind(y, y2) ~ x * g + poly(z, 2)", "cbind(y, y2, w) ~ C(f, sum) + ns(x, 3) + l",
     "log(w) ~ f + g:x + o", "cbind(y, y2) ~ h + bs(x, df = 4) - 1",
+    "y ~ x", "y ~ x + I(2 * x) + f", "y ~ 1", "y ~ x - 1",
 ]]
+LM.append({"kind": "lm", "formula": "y ~ poly(x, 3) * f", "data": "d1"})
+LM.append({"kind": "lm", "formula": "y ~ x + f", "data": "d2", "weights": "w"})
+LM.append({"kind": "lm", "formula": "y ~ f * g + x", "data": "d3"})
 ALL_CASES = ALL_CASES + LM
 
 GAMFIT = []

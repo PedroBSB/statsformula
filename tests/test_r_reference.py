@@ -171,7 +171,8 @@ def _run(cs, k):
         from sklearn.linear_model import LinearRegression
         from statsformula.sklearn import FormulaEstimator
         d = DATA[cs["data"]]
-        return FormulaEstimator(cs["formula"], LinearRegression(fit_intercept=False)).fit(d), d
+        kw = {"sample_weight": d[cs["weights"]].to_numpy()} if cs.get("weights") else {}
+        return FormulaEstimator(cs["formula"], LinearRegression(fit_intercept=False)).fit(d, **kw), d
     if k == "gamfit":
         import test_mgcv_helpers
         return test_mgcv_helpers.run_gamfit_case(cs, DATA)
@@ -266,7 +267,15 @@ def test_against_r(case):
         coef = np.atleast_2d(est.estimator_.coef_)  # (n_responses, n_features)
         R = np.column_stack([num(c) for c in r["coef"]]).T
         assert est.design_columns_ == r["rownames"]
-        np.testing.assert_allclose(coef, R, rtol=1e-7, atol=1e-9)
+        if np.isnan(R).any():
+            # rank deficient: sklearn's minimum-norm solution is not lm's (aliased = NA), but
+            # summary() refits with lm's pivoted QR; the fitted values agree either way
+            ct = est.summary().coefficients
+            ok = ~np.isnan(R[0])
+            np.testing.assert_allclose(ct["Estimate"].reindex(np.asarray(est.design_columns_)[ok]),
+                                       R[0, ok], rtol=1e-7, atol=1e-9)
+        else:
+            np.testing.assert_allclose(coef, R, rtol=1e-7, atol=1e-9)
         from statsformula.sklearn import design_matrices
         _, Xd = design_matrices(cs["formula"], d)
         fitted = np.column_stack([np.asarray(est.predict(d.loc[Xd.index]))]) if est.predict(d.head(1)).ndim == 1 \

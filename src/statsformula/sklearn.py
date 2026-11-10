@@ -403,7 +403,75 @@ class FormulaEstimator(MetaEstimatorMixin, BaseEstimator):
         self.estimator_ = clone(self.estimator).fit(Xd, self._y_values(Y), **params)
         if hasattr(self.estimator_, "classes_"):
             self.classes_ = self.estimator_.classes_
+        # kept for summary()
+        self._train_ = {"X": Xd.to_numpy(), "Y": Y, "rows": rows, "n_deleted": n - len(rows),
+                        "weights": params.get("sample_weight"),
+                        "intercept": "(Intercept)" in Xm.columns}
         return self
+
+    def summary(self):
+        """Summary of the fit on the training data.
+
+        For ``LinearRegression`` (ordinary or weighted least squares) this is R's
+        ``summary(lm(formula, data))``: coefficient table with standard errors,
+        t tests and significance stars, residual quantiles, residual standard
+        error, (adjusted) R^2 and the overall F test, computed with ``lm``'s
+        pivoted QR (so aliased columns show as ``NA``, as in R).  A multi-response
+        fit gives one table per response (``summary.mlm``).  Other estimators get
+        an :class:`~statsformula._summary.EstimatorSummary` (coefficients if the
+        estimator has them, training score, no standard errors).
+        """
+        from sklearn.linear_model import LinearRegression
+        from ._summary import EstimatorSummary, LmSummary, MlmSummary
+        check_is_fitted(self, "estimator_")
+        tr = self._train_
+        inner = self.estimator_
+        X, cols = tr["X"], list(self.design_columns_)
+        Y = tr["Y"]
+        env = {} if self.env is None else self.env
+        try:
+            fstr = str(coerce_formula(self.formula, env))
+        except Exception:
+            fstr = str(self.formula)
+        if type(inner) is LinearRegression and not getattr(inner, "positive", False):
+            intercept = tr["intercept"] or inner.fit_intercept
+            if inner.fit_intercept and "(Intercept)" not in cols:
+                X = np.column_stack([np.ones(len(X)), X])
+                cols = ["(Intercept)"] + cols
+            call = "FormulaEstimator(formula = %s, estimator = %r)" % (fstr, inner)
+            rown = [str(int(i) + 1) for i in tr["rows"]]
+            out = []
+            for j in range(Y.shape[1]):
+                yj = pd.to_numeric(Y.iloc[:, j]).to_numpy(dtype=float)
+                out.append(LmSummary(X, yj, cols, intercept, weights=tr["weights"], rownames=rown,
+                                     n_deleted=tr["n_deleted"], call=call, response=str(Y.columns[j])))
+            return out[0] if len(out) == 1 else MlmSummary(out)
+        coef = None
+        if hasattr(inner, "coef_"):
+            C = np.atleast_2d(np.asarray(inner.coef_, dtype=float))
+            ic = np.atleast_1d(np.asarray(getattr(inner, "intercept_", np.zeros(C.shape[0])), dtype=float))
+            if C.shape[1] == len(cols):
+                names = cols
+                if getattr(inner, "fit_intercept", False):
+                    C = np.column_stack([ic.reshape(-1)[:C.shape[0]] if ic.size >= C.shape[0]
+                                         else np.repeat(ic, C.shape[0]), C])
+                    names = ["(intercept_)" if "(Intercept)" in cols else "(Intercept)"] + cols
+                labels = ["Estimate"] if C.shape[0] == 1 else (
+                    [str(c) for c in getattr(inner, "classes_", range(C.shape[0]))][-C.shape[0]:]
+                    if hasattr(inner, "classes_") and len(inner.classes_) == C.shape[0]
+                    else [str(c) for c in self.response_names_][:C.shape[0]])
+                coef = pd.DataFrame(C.T, index=names, columns=labels)
+        score, name = None, None
+        try:
+            yv = self._y_values(Y)
+            kw = {} if tr["weights"] is None else {"sample_weight": tr["weights"]}
+            score = float(inner.score(pd.DataFrame(tr["X"], columns=self.design_columns_), yv, **kw))
+            from sklearn.base import is_classifier
+            name = "Accuracy" if is_classifier(inner) else "R-squared"
+        except Exception:
+            pass
+        return EstimatorSummary(fstr, inner, len(tr["rows"]), tr["n_deleted"], self.design_columns_, coef,
+                                None, score, name)
 
     # -- delegation -----------------------------------------------------------
     def predict(self, X, **params):
@@ -449,6 +517,16 @@ class FormulaEstimator(MetaEstimatorMixin, BaseEstimator):
 # ---------------------------------------------------------------------------
 # Penalized GAM regressor
 # ---------------------------------------------------------------------------
+
+class _ParamOnlySpec:
+    """Stand-in for a GamSpec when a GAMRegressor formula has no smooths."""
+
+    def __init__(self, spec, ncol):
+        self.nsdf = ncol
+        self.smooths = []
+        self.penalties = []
+        self.pterms = getattr(spec, "terms", None)
+
 
 class GAMRegressor(RegressorMixin, BaseEstimator):
     """Gaussian GAM with mgcv's smoothing penalties (``mgcv::gam(formula, method=)``).
@@ -540,7 +618,26 @@ class GAMRegressor(RegressorMixin, BaseEstimator):
         self.edf_ = self.fits_[0].edf.sum() if one else np.array([ft.edf.sum() for ft in self.fits_])
         self.scale_ = self.fits_[0].scale if one else np.array([ft.scale for ft in self.fits_])
         self.sp_names_ = [p.name for p in self.penalties_]
+        self._assign_ = list(getattr(Xm, "assign", []) or [])
         return self
+
+    def summary(self):
+        """``summary.gam`` of the fit (:class:`statsformula.GamSummary`): parametric
+        coefficients, smooth-term tests, R^2, deviance explained; a list with one
+        summary per response for ``cbind(y1, y2) ~ ...``."""
+        from ._gamfit import GamSummary
+        from ._mgcv import GamSpec
+        check_is_fitted(self, "fits_")
+        env = {} if self.env is None else self.env
+        f = coerce_formula(self.formula, env)
+        spec = self.model_spec_
+        if not isinstance(spec, GamSpec):  # no smooths: a plain parametric model
+            spec = _ParamOnlySpec(spec, len(self.design_columns_))
+        out = []
+        for j, ft in enumerate(self.fits_):
+            fj = str(f) if len(self.fits_) == 1 else "%s ~ %s" % (self.response_names_[j], str(f).split("~", 1)[1].strip())
+            out.append(GamSummary(ft, spec, self.design_columns_, fj, assign=self._assign_ or None))
+        return out[0] if len(out) == 1 else out
 
     def _design(self, X):
         check_is_fitted(self, "model_spec_")
@@ -956,6 +1053,161 @@ class PathModel(BaseEstimator):
         P = self._params_.iloc[o]
         lab = ["%s%s%s" % (a, b, c) for a, b, c in P[["lhs", "op", "rhs"]].itertuples(index=False)]
         return pd.DataFrame(self._vcov_[np.ix_(o, o)], index=lab, columns=lab)
+
+    # -- fit measures and summary ------------------------------------------------
+    def _moments(self):
+        """Sample and model-implied moments of the linear system (lavaan, fixed.x)."""
+        s, theta = self.system_, self.theta_
+        n = s.n
+        names, cols = [], []
+        for j, nm in enumerate(s.xnames):
+            if nm != "(Intercept)" and nm not in names:
+                names.append(nm)
+                cols.append(s.X[:, j])
+        Xu = np.column_stack(cols) if cols else np.zeros((n, 0))
+        B, G, P = s.unpack(theta)
+        Ainv = np.linalg.inv(np.eye(s.k) - B)
+        Xc = s.X - s.X.mean(axis=0)
+        Sfull = Xc.T @ Xc / n
+        Sxu = Xc.T @ (Xu - Xu.mean(axis=0)) / n
+        Syy = Ainv @ (G @ Sfull @ G.T + P) @ Ainv.T
+        Syx = Ainv @ G @ Sxu
+        muy = Ainv @ G @ s.X.mean(axis=0)
+        return Xu, names, B, G, P, Syy, Syx, muy
+
+    def fit_measures(self) -> pd.Series:
+        """lavaan's ``fitMeasures()`` for the path model (ML, ``fixed.x = TRUE``,
+        mean structure): ``npar``, ``chisq``, ``df``, ``pvalue``, ``baseline.chisq``,
+        ``baseline.df``, ``baseline.pvalue``, ``cfi``, ``tli``, ``logl`` (the
+        log-likelihood conditional on the exogenous variables, as lavaan reports it),
+        ``unrestricted.logl``, ``aic``, ``bic``, ``bic2``, ``ntotal``, ``rmsea``,
+        ``rmsea.ci.lower``, ``rmsea.ci.upper``, ``rmsea.pvalue``,
+        ``rmsea.notclose.pvalue``, ``srmr``.
+
+        Needs the model as one linear system on shared rows (see *Inference*)."""
+        from scipy import optimize, stats
+        check_is_fitted(self, "estimators_")
+        if self.system_ is None or self.theta_ is None:
+            raise RError("fit measures need linear equations fitted on the same rows (one linear system)")
+        s = self.system_
+        n, k = s.n, s.k
+        log2pi = np.log(2 * np.pi)
+        Xu, _, B, G, P, Syy, Syx, muy = self._moments()
+        qx = Xu.shape[1]
+
+        def logdet(M):
+            return float(np.linalg.slogdet(M)[1]) if M.size else 0.0
+
+        Sxx = np.cov(Xu, rowvar=False, ddof=0).reshape(qx, qx) if qx else np.zeros((0, 0))
+        # lavaan (fixed.x) reports the likelihood conditional on the exogenous variables
+        ll0 = float(s.loglik(self.theta_, grad=False))
+        D = np.column_stack([np.ones(n), Xu])
+        E = s.Y - D @ np.linalg.lstsq(D, s.Y, rcond=None)[0]
+        ll1 = -0.5 * n * (k * log2pi + logdet(E.T @ E / n) + k)
+        npar = int(s.npar)
+        ndat = k * (k + 1) // 2 + k * (qx + 1)
+        df = ndat - npar
+        chisq = max(2.0 * (ll1 - ll0), 0.0)
+        pvalue = float(stats.chi2.sf(chisq, df)) if df > 0 else np.nan
+        s2 = s.Y.var(axis=0)
+        llb = float(np.sum(-0.5 * n * (log2pi + np.log(s2) + 1)))
+        bchisq = 2.0 * (ll1 - llb)
+        bdf = ndat - 2 * k
+        t1 = max(chisq - df, 0.0)
+        t2 = max(chisq - df, bchisq - bdf, 0.0)
+        cfi = 1.0 if t2 == 0 else 1.0 - t1 / t2
+        tli = 1.0 if df == 0 else ((bchisq / bdf - chisq / df) / (bchisq / bdf - 1.0) if bdf > 0 else np.nan)
+        if df > 0:
+            rmsea = float(np.sqrt(max(chisq / n / df - 1.0 / n, 0.0)))
+
+            def ncp_root(target):
+                def f(lam):
+                    cdf = stats.ncx2.cdf(chisq, df, lam) if lam > 0 else stats.chi2.cdf(chisq, df)
+                    return cdf - target
+                if f(0.0) < 0:
+                    return 0.0
+                hi = max(chisq, 1.0)
+                while f(hi) > 0:
+                    hi *= 2
+                return optimize.brentq(f, 0.0, hi, xtol=1e-12)
+
+            lo = np.sqrt(ncp_root(0.95) / (n * df))
+            up = np.sqrt(ncp_root(0.05) / (n * df))
+            rp = float(1 - stats.ncx2.cdf(chisq, df, n * df * 0.05 ** 2))
+            rnp = float(stats.ncx2.cdf(chisq, df, n * df * 0.08 ** 2))
+        else:
+            rmsea, lo, up, rp, rnp = 0.0, 0.0, 0.0, np.nan, np.nan
+        # SRMR (Bentler, with the mean structure)
+        Y = s.Y
+        Sy = np.cov(np.column_stack([Y, Xu]), rowvar=False, ddof=0)
+        mu_s = np.concatenate([Y.mean(axis=0), Xu.mean(axis=0)])
+        Sig = np.block([[Syy, Syx], [Syx.T, Sxx]]) if qx else Syy
+        mu_m = np.concatenate([muy, Xu.mean(axis=0)])
+        sd = np.sqrt(np.diag(Sy))
+        Rr = (Sy - Sig) / np.outer(sd, sd)
+        il = np.tril_indices(len(sd))
+        res = np.concatenate([Rr[il], (mu_s - mu_m) / sd])
+        srmr = float(np.sqrt(np.mean(res ** 2)))
+        out = {"npar": npar, "chisq": chisq, "df": df, "pvalue": pvalue, "baseline.chisq": bchisq,
+               "baseline.df": bdf, "baseline.pvalue": float(stats.chi2.sf(bchisq, bdf)) if bdf > 0 else np.nan,
+               "cfi": cfi, "tli": tli, "logl": ll0, "unrestricted.logl": ll1, "aic": -2 * ll0 + 2 * npar,
+               "bic": -2 * ll0 + np.log(n) * npar, "bic2": -2 * ll0 + np.log((n + 2) / 24.0) * npar,
+               "ntotal": n, "rmsea": rmsea, "rmsea.ci.lower": float(lo), "rmsea.ci.upper": float(up),
+               "rmsea.pvalue": rp, "rmsea.notclose.pvalue": rnp, "srmr": srmr}
+        return pd.Series(out, dtype=float)
+
+    def rsquare(self) -> pd.Series:
+        """R^2 of every endogenous variable: ``1 - psi_ii / var_ii`` with the
+        model-implied variance (lavaan's ``lavInspect(fit, "r2")``); per-equation
+        fits without a linear system use the equation's own R^2."""
+        check_is_fitted(self, "estimators_")
+        if self.system_ is not None and self.theta_ is not None:
+            _, _, _, _, P, Syy, _, _ = self._moments()
+            return pd.Series(1.0 - np.diag(P) / np.diag(Syy), index=self.endogenous_)
+        out = {}
+        P = self._params_
+        for eq in self.equations_:
+            psi = P[(P.lhs == eq.response) & (P.op == "~~") & (P.rhs == eq.response)]["est"]
+            est = self.estimators_[eq.response]
+            if isinstance(est, GAMRegressor):
+                y = est.fits_[0].y
+            else:
+                Y = getattr(est, "_train_", {}).get("Y")
+                y = None if Y is None else pd.to_numeric(Y.iloc[:, 0]).to_numpy(dtype=float)
+            ok = y is not None and len(psi) and np.isfinite(psi.iloc[0])
+            out[eq.response] = 1.0 - float(psi.iloc[0]) / float(np.var(y)) if ok else np.nan
+        return pd.Series(out, dtype=float)
+
+    def summary(self, fit_measures: bool = True, effects: bool = False):
+        """lavaan-style summary (``summary(fit, fit.measures = TRUE, rsquare = TRUE)``):
+        estimator, model test (chi-square), baseline comparison (CFI, TLI),
+        log-likelihood and information criteria, RMSEA, SRMR, and the parameter
+        estimates grouped as Regressions, Covariances, Intercepts and Variances,
+        followed by R-Square.  ``effects=True`` adds the indirect and total effects
+        with delta-method standard errors."""
+        from ._summary import PathSummary
+        check_is_fitted(self, "estimators_")
+        fm = None
+        if fit_measures and self.system_ is not None and self.theta_ is not None:
+            fm = self.fit_measures()
+        eff = None
+        if effects:
+            try:
+                eff = {k: self.effects(k, se=True) for k in ("indirect", "total")}
+            except RError:
+                eff = None
+        try:
+            r2 = self.rsquare()
+        except Exception:
+            r2 = None
+        smooth = {}
+        for eq in self.equations_:
+            est = self.estimators_[eq.response]
+            if isinstance(est, GAMRegressor) and est.model_spec_ is not None and getattr(est.model_spec_, "smooths", None):
+                gs = est.summary()
+                cols = [c for c in est.design_columns_[est.model_spec_.nsdf:]]
+                smooth[eq.response] = (gs.s_table, cols)
+        return PathSummary(self, self.coefficients(), fm, r2, eff, smooth)
 
     # -- prediction ---------------------------------------------------------------
     def predict(self, X) -> pd.DataFrame:

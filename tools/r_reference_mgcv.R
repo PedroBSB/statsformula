@@ -39,5 +39,13 @@ gamfit_case <- function(cs) {
                   list(names = as.list(rownames(pt)), est = as.list(unname(pt[, 1])), se = as.list(unname(pt[, 2])),
                        t = as.list(unname(pt[, 3])), p = as.list(unname(pt[, 4]))) },
        residual_df = length(b$y) - sum(b$edf), r_sq = summary(b)$r.sq,
-       criterion = as.numeric(b$gcv.ubre))
+       criterion = as.numeric(b$gcv.ubre),
+       stable = { st <- summary(b)$s.table
+                  list(names = as.list(rownames(st)), edf = as.list(unname(st[, 1])), refdf = as.list(unname(st[, 2])),
+                       stat = as.list(unname(st[, 3])), p = as.list(unname(st[, 4]))) },
+       pterms = { pt <- summary(b)$pTerms.table
+                  if (is.null(pt)) NULL else list(names = as.list(rownames(pt)), df = as.list(unname(pt[, 1])),
+                       stat = as.list(unname(pt[, 2])), p = as.list(unname(pt[, 3]))) },
+       edf1 = as.list(unname(b$edf1)), dev_expl = summary(b)$dev.expl,
+       printed = as.list(capture.output(print(summary(b)))))
 }

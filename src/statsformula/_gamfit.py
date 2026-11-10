@@ -165,6 +165,7 @@ def _check_identifiable(prob):
                       "(e.g. a parametric term duplicated by a smooth, as in y ~ x + s(x)); "
                       "standard errors are meaningless and mgcv would set %d coefficient(s) to zero"
                       % (r, prob.p, prob.p - r), RuntimeWarning, stacklevel=3)
+    return r
 
 
 def fit_penalized(X, y, penalties, method: str = "REML", sp=None, weights=None, gamma: float = 1.0,
@@ -182,7 +183,7 @@ def fit_penalized(X, y, penalties, method: str = "REML", sp=None, weights=None, 
         raise ValueError("method must be 'REML' or 'GCV.Cp'")
     method = "GCV.Cp" if method == "GCV" else method
     prob = _Problem(X, y, list(penalties), w, gamma)
-    _check_identifiable(prob)
+    rank = _check_identifiable(prob)
     m = len(prob.pens)
     names = list(sp_names) if sp_names is not None else [p.name for p in prob.pens]
     if sp is None:
@@ -226,7 +227,15 @@ def fit_penalized(X, y, penalties, method: str = "REML", sp=None, weights=None, 
         scale = rss / (prob.n - tau)
         crit_val = prob.gcv(rho)[0] if method == "GCV.Cp" else prob.reml(rho)[0]
     fitted = X @ beta
-    return PenalizedFit(beta, sp_hat, names, fitted, edf, scale, crit_val, method, Hinv * scale, rss, converged)
+    out = PenalizedFit(beta, sp_hat, names, fitted, edf, scale, crit_val, method, Hinv * scale, rss, converged)
+    # for summary(): mgcv's edf1 = diag(2F - FF), the R factor of sqrt(W) X, the data
+    out.edf1 = 2.0 * edf - np.sum(F * F.T, axis=1)
+    out.R = np.linalg.qr(prob.Xw, mode="r")
+    out.y = y
+    out.weights = w
+    out.rank = rank
+    out.penalties = list(prob.pens)
+    return out
 
 
 class GamFit:
@@ -292,60 +301,218 @@ class GamFit:
         return pd.DataFrame({"fit": fit, "se_fit": se}, index=Xn.index)
 
     def summary(self) -> "GamSummary":
-        """Parametric coefficient table of ``summary.gam``: estimate, standard error
-        (``sqrt(diag(Vp))``), t value and two-sided p-value on ``residual_df`` degrees
-        of freedom."""
-        return GamSummary(self)
+        """``summary.gam``: parametric coefficients (``p_table``), approximate
+        significance of the smooth terms (``s_table``), parametric term tests
+        (``pterms_table``) and the fit statistics; prints like R."""
+        return GamSummary(self._fit, self.model_matrix.model_spec, list(self.model_matrix.columns),
+                          self.formula, y=self.y.to_numpy(dtype=float),
+                          fitted=self.fitted_values.to_numpy(dtype=float),
+                          assign=getattr(self.model_matrix, "assign", None))
 
     def __repr__(self):
         return "<GamFit %s %s: edf=%.3f scale=%.4g>" % (self.formula, self.method, self.edf.sum(), self.scale)
 
 
-class GamSummary:
-    """``summary(gam_fit)``: ``p_table`` (parametric terms) and the fit statistics.
+def _null_space_zero(sm, penalties) -> bool:
+    """mgcv's ``null.space.dim == 0``: the smooth's total penalty (after the
+    identifiability constraints are absorbed) has full rank, as for ``cs``, ``ts``,
+    ``cc``, ``re`` or ``m = 1`` smooths."""
+    Ss = [p.S for p in penalties if p.smooth == sm.label]
+    if not Ss:
+        return False
+    tot = sum(S / np.linalg.norm(S) for S in Ss)
+    ev = np.linalg.eigvalsh((tot + tot.T) / 2)
+    return int(np.sum(ev > ev.max() * np.finfo(float).eps ** 0.75)) == tot.shape[0]
 
-    The smooth-term tests of mgcv (``s.table``) are not computed; ``edf`` lists the
-    effective degrees of freedom of each smooth instead.
+
+def _is_random(sm) -> bool:
+    return getattr(sm.spec, "kind", "s") == "s" and getattr(sm.spec, "bs", None) == "re"
+
+
+def _mroot(S):
+    ev, vec = np.linalg.eigh((S + S.T) / 2)
+    keep = ev > max(ev.max(), 0) * np.finfo(float).eps ** 0.8
+    return vec[:, keep] * np.sqrt(ev[keep])
+
+
+class GamSummary:
+    """``summary(gam_fit)`` (mgcv's ``summary.gam``), printed like R.
+
+    Attributes: ``p_table`` (parametric coefficients: ``Estimate``, ``Std. Error``,
+    ``t value``, ``Pr(>|t|)``), ``s_table`` (smooth terms: ``edf``, ``Ref.df``,
+    ``F``, ``p-value``, Wood's (2013) tests), ``pterms_table`` (Wald F test of each
+    parametric term, as in ``anova.gam``), ``edf`` (per smooth), ``residual_df``,
+    ``scale``, ``r_sq`` (adjusted R^2), ``dev_expl`` (deviance explained), ``n``,
+    ``rank``, ``method``, ``criterion``.
     """
 
-    def __init__(self, fit: GamFit):
+    def __init__(self, fit: "PenalizedFit", spec, columns, formula, y=None, fitted=None, assign=None):
         import pandas as pd
         from scipy import stats
-        spec = fit.model_matrix.model_spec
+        from ._davies import smooth_test_stat
         k = spec.nsdf
-        est = fit.coefficients.to_numpy()[:k]
-        se = np.sqrt(np.diag(fit.Vp)[:k])
+        coef = np.asarray(fit.coef, dtype=float)
+        Vp = np.asarray(fit.Vp, dtype=float)
+        n = len(fit.fitted)
+        edf_all = np.asarray(fit.edf, dtype=float)
+        df = float(n - edf_all.sum())
+        se_all = np.sqrt(np.maximum(np.diag(Vp), 0.0))
+        est, se = coef[:k], se_all[:k]
         with np.errstate(divide="ignore", invalid="ignore"):
             t = est / se
-        df = fit.residual_df
         p = 2.0 * stats.t.sf(np.abs(t), df)
         self.p_table = pd.DataFrame({"Estimate": est, "Std. Error": se, "t value": t, "Pr(>|t|)": p},
-                                    index=list(fit.coefficients.index[:k]))
-        edf, start = {}, k
+                                    index=list(columns[:k]))
+        # parametric terms (anova.gam's pTerms.table)
+        rows = []
+        pterms = getattr(spec, "pterms", None)
+        labels = list(getattr(pterms, "term_labels", []) or [])
+        if assign is not None and labels:
+            asg = np.asarray(list(assign)[:k])
+            for i, lab in enumerate(labels):
+                ind = np.where(asg == i + 1)[0]
+                if not len(ind):
+                    continue
+                b = coef[ind]
+                V = Vp[np.ix_(ind, ind)]
+                if len(b) == 1:
+                    nb, chi = 1, float(b[0] ** 2 / V[0, 0])
+                else:
+                    ev, vec = np.linalg.eigh((V + V.T) / 2)
+                    o = np.argsort(-ev)
+                    ev, vec = ev[o], vec[:, o]
+                    nb = int(min(len(b), np.sum(ev > np.finfo(float).eps ** 0.5 * ev[0])))
+                    inv = np.zeros_like(ev)
+                    inv[:nb] = 1 / ev[:nb]
+                    chi = float(b @ (vec * inv) @ vec.T @ b)
+                rows.append((lab, nb, chi / nb, stats.f.sf(chi / nb, nb, df)))
+        self.pterms_table = pd.DataFrame([r[1:] for r in rows], index=[r[0] for r in rows],
+                                         columns=["df", "F", "p-value"])
+        # smooth terms
+        R = fit.R
+        sig2 = float(fit.scale)
+        sp = np.asarray(fit.sp, dtype=float)
+        pens = list(getattr(fit, "penalties", spec.penalties))
+        p_all = len(coef)
+        recs, edf_s = [], {}
+        start = k
+        firsts = []
         for sm in spec.smooths:
-            m = sm.X.shape[1]
-            edf[sm.label] = float(fit.edf.iloc[start:start + m].sum())
-            start += m
-        self.edf = pd.Series(edf, dtype=float)
+            firsts.append((start, start + sm.X.shape[1]))
+            start += sm.X.shape[1]
+        for i, (sm, (a, b)) in enumerate(zip(spec.smooths, firsts)):
+            ind = np.arange(a, b)
+            edfi = float(edf_all[a:b].sum())
+            edf1i = float(np.asarray(fit.edf1)[a:b].sum())
+            edf_s[sm.label] = edfi
+            fixed = bool(getattr(sm.spec, "fixed", False))
+            if not fixed and _null_space_zero(sm, pens):
+                stat, pval, rank = self._re_test(i, ind, firsts, spec, coef, Vp, R, sig2, sp, pens, df, p_all)
+            else:
+                stat, pval, rank = smooth_test_stat(coef[a:b], R[:, a:b], Vp[a:b, a:b],
+                                             min(b - a, edf1i), type=0, res_df=df)
+            recs.append((sm.label, edfi, rank, stat / rank if rank else np.nan, pval))
+        self.s_table = pd.DataFrame([r[1:] for r in recs], index=[r[0] for r in recs],
+                                    columns=["edf", "Ref.df", "F", "p-value"])
+        self.edf = pd.Series(edf_s, dtype=float)
         self.residual_df = df
-        self.scale = fit.scale
-        self.n = len(fit.fitted_values)
-        y, mu = fit.y.to_numpy(dtype=float), fit.fitted_values.to_numpy(dtype=float)
-        w = np.ones_like(y) if fit.weights is None else np.sqrt(np.asarray(fit.weights, dtype=float))
-        ybar = np.sum(w * w * y) / np.sum(w * w)
-        self.r_sq = float(1.0 - np.var(w * (y - mu), ddof=1) * (self.n - 1)
-                          / (np.var(w * (y - ybar), ddof=1) * df))
+        self.scale = sig2
+        self.n = n
+        y = np.asarray(fit.y if y is None else y, dtype=float)
+        mu = np.asarray(fit.fitted if fitted is None else fitted, dtype=float)
+        w = np.ones_like(y) if fit.weights is None else np.asarray(fit.weights, dtype=float)
+        ybar = np.sum(w * y) / np.sum(w)
+        sw = np.sqrt(w)
+        self.r_sq = float(1.0 - np.var(sw * (y - mu), ddof=1) * (n - 1) / (np.var(sw * (y - ybar), ddof=1) * df))
+        self.deviance = float(np.sum(w * (y - mu) ** 2))
+        self.null_deviance = float(np.sum(w * (y - ybar) ** 2))
+        self.dev_expl = (self.null_deviance - self.deviance) / self.null_deviance
         self.method = fit.method
-        self.criterion = fit.criterion
-        self.formula = fit.formula
+        self.criterion = float(fit.criterion)
+        self.formula = formula
+        self.rank = int(getattr(fit, "rank", p_all))
+        self.np = p_all
+        self.family, self.link = "gaussian", "identity"
 
-    def __repr__(self):
-        lines = ["Formula: %s" % self.formula, "", "Parametric coefficients:", self.p_table.to_string(), ""]
-        if len(self.edf):
-            lines += ["Approximate edf of smooth terms:", self.edf.to_string(), ""]
-        lines.append("R-sq.(adj) = %.4g   %s = %.6g   Scale est. = %.6g   n = %d"
-                     % (self.r_sq, self.method, self.criterion, self.scale, self.n))
-        return "\n".join(lines)
+    @staticmethod
+    def _re_test(m, ind, firsts, spec, coef, Vp, R, sig2, sp, pens, df_res, p):
+        """mgcv's ``reTest`` (with ``recov``) for smooths without a penalty null space."""
+        rind = np.zeros(p, dtype=bool)
+        for i, sm in enumerate(spec.smooths):
+            if i != m and _is_random(sm):
+                rind[firsts[i][0]:firsts[i][1]] = True
+        if not rind.any():
+            S1 = np.zeros((p, p))
+            for lam, pen in zip(sp, pens):
+                S1[pen.columns, pen.columns] += lam * pen.S
+            Ve = Vp @ (R.T @ R) @ Vp / sig2
+            Ve = (Ve + Ve.T) / 2
+            LRB = np.vstack([R, _mroot(S1).T])
+        else:
+            mp = np.zeros(p, dtype=int)
+            p2 = int(rind.sum())
+            mp[rind] = np.arange(p2)
+            mp[~rind] = np.arange(p - p2)
+            R1, R2 = R[:, ~rind], R[:, rind]
+            S1 = np.zeros((p - p2, p - p2))
+            S2 = np.zeros((p2, p2))
+            for lam, pen in zip(sp, pens):
+                cols = np.arange(pen.off, pen.off + pen.S.shape[0])
+                if rind[cols[0]]:
+                    S2[np.ix_(mp[cols], mp[cols])] += lam * pen.S
+                else:
+                    S1[np.ix_(mp[cols], mp[cols])] += lam * pen.S
+            ev, vec = np.linalg.eigh((S2 + S2.T) / 2)
+            keep = ev > ev.max() * np.finfo(float).eps ** 0.8
+            inv = np.where(keep, 1 / np.where(keep, ev, 1), 0.0)
+            S2r = np.sqrt(inv)[:, None] * vec.T
+            L = np.linalg.cholesky(np.eye(R.shape[0]) + (S2r @ R2.T).T @ (S2r @ R2.T)).T
+            Ve = (L @ R @ Vp).T @ (L @ R @ Vp) / sig2
+            LRB = np.vstack([L @ R1, _mroot(S1).T])
+            ind_m = mp[ind]
+            other = np.setdiff1d(np.arange(LRB.shape[1]), ind_m)
+            Rm = np.linalg.qr(LRB[:, np.concatenate([other, ind_m])], mode="r")[-len(ind):, -len(ind):]
+            return GamSummary._re_finish(Rm, Ve, ind, coef, sig2, df_res)
+        other = np.setdiff1d(np.arange(p), ind)
+        Rm = np.linalg.qr(LRB[:, np.concatenate([other, ind])], mode="r")[-len(ind):, -len(ind):]
+        return GamSummary._re_finish(Rm, Ve, ind, coef, sig2, df_res)
+
+    @staticmethod
+    def _re_finish(Rm, Ve, ind, coef, sig2, df_res):
+        from ._davies import psum_chisq
+        B = _mroot(Ve[np.ix_(ind, ind)])
+        d = Rm @ coef[ind]
+        stat = float(np.sum(d ** 2) / sig2)
+        RB = Rm @ B
+        ev = np.linalg.eigvalsh(RB.T @ RB / sig2)[::-1]
+        ev[ev < 0] = 0
+        rank = int(np.sum(ev > ev.max() * np.finfo(float).eps ** 0.8))
+        kk = max(1, int(np.rint(df_res)))
+        pval = psum_chisq(0, np.concatenate([ev, [-stat / kk]]), df=np.concatenate([np.ones(len(ev)), [kk]]))
+        return stat, pval, rank
+
+    def __str__(self):
+        from ._rprint import format_c, print_coefmat
+        out = ["", "Family: %s " % self.family, "Link function: %s " % self.link, "", "Formula:", str(self.formula)]
+        if len(self.p_table):
+            out += ["", "Parametric coefficients:",
+                    print_coefmat(self.p_table.to_numpy(), list(self.p_table.index), list(self.p_table.columns))]
+        out.append("")
+        if len(self.s_table):
+            out += ["Approximate significance of smooth terms:",
+                    print_coefmat(self.s_table.to_numpy(), list(self.s_table.index), list(self.s_table.columns),
+                                  has_pvalue=True, cs_ind=[0])]
+        out.append("")
+        if self.rank < self.np:
+            out.append("Rank: %d/%d" % (self.rank, self.np))
+        meth = {"REML": "-REML", "ML": "-ML", "GCV.Cp": "GCV"}.get(self.method, self.method)
+        out.append("R-sq.(adj) =  %s   Deviance explained = %s%%" % (format_c(self.r_sq, 3, 5),
+                                                                    format_c(self.dev_expl * 100, 3, 4)))
+        out.append("%s = %s  Scale est. = %s  n = %d" % (meth, format_c(self.criterion, 5),
+                                                          format_c(self.scale, 5, 8, "-"), self.n))
+        return "\n".join(out)
+
+    __repr__ = __str__
 
 
 def gam(formula, data, method: str = "REML", sp=None, weights=None, gamma: float = 1.0, knots=None,

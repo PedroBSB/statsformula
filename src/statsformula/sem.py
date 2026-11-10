@@ -326,27 +326,42 @@ class SemFit:
     object; ``sem_data``: the rewritten model and data.
     """
 
-    def __init__(self, estimates, defined, backend, sem_data, name):
+    def __init__(self, estimates, defined, backend, sem_data, name, fit_stats=None):
         self.estimates = estimates
         self.defined = defined
         self.backend = backend
         self.sem_data = sem_data
         self.name = name
+        self.fit_stats = fit_stats
+
+    def summary(self):
+        """lavaan-style summary: fit statistics (when the backend provides them) and the
+        estimates grouped as Latent Variables, Regressions, Covariances, Intercepts,
+        Variances and Defined Parameters, with the backend's standard errors and z
+        tests where it computes them (semopy)."""
+        from ._summary import SemSummary
+        return SemSummary(self)
 
     def __repr__(self):
         return "<SemFit %s: %d parameters>" % (self.name, len(self.estimates))
 
 
-def _finish(pt, values, sd, backend, name):
+def _finish(pt, values, sd, backend, name, se=None, fit_stats=None):
     est = pt[pt.op.isin(["=~", "~", "~~", "~1"])][["lhs", "op", "rhs", "label", "free"]].copy()
     est["est"] = values
+    if se is not None:
+        from scipy import stats
+        est["se"] = se
+        with np.errstate(divide="ignore", invalid="ignore"):
+            est["z"] = est["est"] / est["se"]
+        est["pvalue"] = 2 * stats.norm.sf(np.abs(est["z"]))
     est = est.reset_index(drop=True)
     labels = {}
     for lab, v in zip(est.label, est.est):
         if lab:
             labels[lab] = v
     defined = evaluate_defined(sd.defined, labels) if sd.defined else {}
-    return SemFit(est, defined, backend, sd, name)
+    return SemFit(est, defined, backend, sd, name, fit_stats)
 
 
 def _check_constraints(sd, pt, backend):
@@ -414,10 +429,14 @@ def fit_semopy(model: str, data, preset: str = "sem", obj: str = "MLW", solver: 
         so = {"ftol": 1e-12, "maxiter": 10000} if solver_options is None and solver == "SLSQP" else solver_options
         m.fit(df, obj=obj, solver=solver, options=so)
         ins = m.inspect()
-    look = {}
+    look, look_se = {}, {}
     for _, r in ins.iterrows():
         look[(r["lval"], r["op"], r["rval"])] = float(r["Estimate"])
-    vals = []
+        try:
+            look_se[(r["lval"], r["op"], r["rval"])] = float(r["Std. Err"])
+        except (TypeError, ValueError, KeyError):
+            pass
+    vals, ses = [], []
     for _, r in pt[pt.op.isin(["=~", "~", "~~", "~1"])].iterrows():
         if r.op == "=~":
             keys = [(r.rhs, "~", r.lhs), (r.lhs, "=~", r.rhs)]
@@ -429,7 +448,19 @@ def fit_semopy(model: str, data, preset: str = "sem", obj: str = "MLW", solver: 
         if v is None:
             v = float(r.ustart) if not np.isnan(r.ustart) else np.nan
         vals.append(v)
-    return _finish(pt, vals, sd, m, "semopy")
+        ses.append(next((look_se[k] for k in keys if k in look_se), np.nan) if r.free else np.nan)
+    stats_ = None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            st = semopy.calc_stats(m).iloc[0]
+        stats_ = {"chisq": float(st["chi2"]), "df": float(st["DoF"]), "pvalue": float(st["chi2 p-value"]),
+                  "baseline.chisq": float(st["chi2 Baseline"]), "baseline.df": float(st["DoF Baseline"]),
+                  "cfi": float(st["CFI"]), "tli": float(st["TLI"]), "rmsea": float(st["RMSEA"]),
+                  "ntotal": int(len(df)), "npar": int(len(m.param_vals))}
+    except Exception:
+        pass
+    return _finish(pt, vals, sd, m, "semopy", se=ses, fit_stats=stats_)
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +653,7 @@ def fit_pysem(model: str, data, preset: str = "sem", meanstructure: bool = False
             v = (mats["alpha"].loc[L(r.lhs)].iloc[0] if is_lat(r.lhs) else mats["nu"].iloc[
                 list(mats["nu"].index).index(r.lhs), 0]) if "alpha" in mats else np.nan
         vals.append(float(v))
-    return _finish(pt, vals, sd, sem, "pySEM")
+    return _finish(pt, vals, sd, sem, "pySEM", fit_stats={"ntotal": int(len(sd.data))})
 
 
 # ---------------------------------------------------------------------------
