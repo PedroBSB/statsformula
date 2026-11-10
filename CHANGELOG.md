@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.0 (2026-11-09)
 
 * Path-model inference (`PathModel(se=...)`): `coefficients()` now returns lavaan's
   `parameterEstimates()` columns (`est`, `se`, `z`, `pvalue`, `ci.lower`, `ci.upper`) including
