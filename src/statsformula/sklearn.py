@@ -597,39 +597,64 @@ class GAMRegressor(RegressorMixin, BaseEstimator):
 # ---------------------------------------------------------------------------
 
 class PathModel(BaseEstimator):
-    """A system of regressions written as a multi-line formula, fitted equation by equation.
+    """A system of regressions written as a multi-line formula (a path model).
 
     >>> model = '''
     ...   m ~ x + z            # mediator
     ...   y ~ m + x + log(w)   # outcome
     ... '''
     >>> pm = PathModel(model).fit(df)                        # doctest: +SKIP
+    >>> pm.coefficients()          # lavaan's parameterEstimates(): est, se, z, pvalue, CI  # doctest: +SKIP
     >>> pm.predict(new)            # m and y; y uses the *predicted* m   # doctest: +SKIP
-    >>> pm.effects("indirect")     # x -> m -> y, as lavaan's a*b        # doctest: +SKIP
+    >>> pm.effects("indirect", se=True)   # x -> m -> y with delta-method SEs  # doctest: +SKIP
 
     Each line is an R formula (see :mod:`statsformula._path` for the syntax:
     comments, continuation lines, ``y1 + y2 ~ x`` and ``cbind(y1, y2) ~ x``
-    give one equation per response, repeated responses are merged).  Each
-    equation is fitted on its own complete cases with a clone of
-    ``estimator``.  With linear estimators this is the maximum likelihood fit of
-    a recursive path model with uncorrelated disturbances (``lavaan::sem()``
-    with observed variables).
+    give one equation per response, repeated responses are merged); lines
+    ``y1 ~~ y2`` free the covariance of two disturbances.
+
+    **Estimation.**  A recursive model with uncorrelated disturbances is fitted
+    equation by equation (each on its own complete cases) with a clone of
+    ``estimator``; with the default linear estimator this is the maximum
+    likelihood fit (``lavaan::sem()`` with observed variables).  Models with
+    feedback loops (``y1 ~ y2`` and ``y2 ~ y1``: non-recursive) or residual
+    covariances are fitted by full-information maximum likelihood on the rows
+    complete for every equation (needs linear equations in which every
+    endogenous predictor enters as its own column, see below).
+
+    **Inference** (``se``): ``"expected"`` (default) and ``"observed"`` give the
+    standard errors of ``lavaan::sem(information = "expected"/"observed")`` with
+    z tests; ``"lm"`` the per-equation t tests of ``summary(lm())`` (equation by
+    equation estimation only); ``"none"`` skips them.  Expected-information
+    standard errors use the whole system, so they need every equation to be
+    linear in the endogenous variables (``y ~ m + log(x)`` is, ``y ~ log(m)`` is
+    not) and the equations to share their rows; otherwise each equation uses its
+    observed information ``sigma2_ML (X'X)^-1``.  Equations with smooths use
+    mgcv's Bayesian covariance ``Vp``; other estimators (``Ridge`` ...) get no
+    standard errors.
 
     Parameters
     ----------
     model : str
-        Multi-line model: one ``response ~ predictors`` formula per line.
+        Multi-line model: one ``response ~ predictors`` formula per line, and
+        optional ``y1 ~~ y2`` residual covariances.
     estimator : estimator or dict, optional
-        Estimator cloned for every equation, or ``{response: estimator}``
-        (responses missing from the dict use ``LinearRegression``).  Default:
-        ``LinearRegression(fit_intercept=False)`` on the formula's design matrix
-        (which has the intercept), or :class:`GAMRegressor` for equations with
-        ``s()``/``te()``/``ti()`` smooths.
+        Estimator cloned for every equation, or ``{response: estimator}``.
+        Default: ``LinearRegression(fit_intercept=False)`` on the formula's design
+        matrix (which has the intercept), or :class:`GAMRegressor` for equations
+        with ``s()``/``te()``/``ti()`` smooths.
+    estimation : {"auto", "ML", "OLS"}
+        ``"auto"``: equation by equation when that is ML, full-information ML
+        otherwise.  ``"ML"``: always the joint fit.  ``"OLS"``: always equation by
+        equation (inconsistent for non-recursive models).
+    se : {"expected", "observed", "lm", "none"}
+    level : float
+        Confidence level of the intervals (``ci.lower``/``ci.upper``).
     predict_mode : {"propagate", "direct"}
         ``"propagate"`` (default): only exogenous variables are taken from the
-        data; endogenous predictors are replaced by their predictions, upstream
-        first (the reduced form; needs a recursive model).  ``"direct"``: every
-        equation uses the observed values of its predictors.
+        data; endogenous predictors are replaced by their predictions (the
+        reduced form ``(I - B)^-1 G x``, also for non-recursive models).
+        ``"direct"``: every equation uses the observed values of its predictors.
     gam_method : {"REML", "GCV.Cp"}
         Smoothing-parameter method of the default GAM equations.
     contrasts, na_action, env : see :class:`FormulaEstimator`.
@@ -637,16 +662,26 @@ class PathModel(BaseEstimator):
     Attributes
     ----------
     equations_ : list of :class:`PathEquation`
+    covariances_ : list of ``(a, b)`` residual covariances
     estimators_ : dict response -> fitted per-equation estimator
     endogenous_, exogenous_ : variable names
     order_ : responses in causal (topological) order, or None if non-recursive
+    estimation_ : ``"OLS"`` (equation by equation) or ``"ML"`` (joint)
+    loglik_ : log-likelihood of the linear system (when it is one), else None
+    nobs_ : number of rows used (joint fit) or the row indices of every equation (dict)
+    information_ : how the standard errors were computed: ``"expected"``,
+        ``"observed"``, ``"observed (per equation)"`` (the model is not one linear
+        system on shared rows; see *Inference*), ``"lm"`` or ``"none"``
     """
 
-    def __init__(self, model: str = "y ~ x", estimator=None, predict_mode: str = "propagate",
-                 gam_method: str = "REML", contrasts: Optional[dict] = None, na_action: str = "na.omit",
-                 env: Optional[dict] = None):
+    def __init__(self, model: str = "y ~ x", estimator=None, estimation: str = "auto", se: str = "expected",
+                 level: float = 0.95, predict_mode: str = "propagate", gam_method: str = "REML",
+                 contrasts: Optional[dict] = None, na_action: str = "na.omit", env: Optional[dict] = None):
         self.model = model
         self.estimator = estimator
+        self.estimation = estimation
+        self.se = se
+        self.level = level
         self.predict_mode = predict_mode
         self.gam_method = gam_method
         self.contrasts = contrasts
@@ -675,14 +710,21 @@ class PathModel(BaseEstimator):
         return FormulaEstimator(eq.formula, clone(est), y_encoding="auto", contrasts=self.contrasts,
                                 na_action=self.na_action, env=self.env)
 
+    # -- fitting -------------------------------------------------------------
     def fit(self, X, y=None, **fit_params):
         from ._parser import all_vars, parse
-        from ._path import parse_path_model, path_order
+        from ._path import parse_path_system, path_order
         if self.predict_mode not in ("propagate", "direct"):
             raise ValueError("predict_mode must be 'propagate' or 'direct'")
+        if self.estimation not in ("auto", "ML", "OLS"):
+            raise ValueError("estimation must be 'auto', 'ML' or 'OLS'")
+        if self.se not in ("expected", "observed", "lm", "none"):
+            raise ValueError("se must be 'expected', 'observed', 'lm' or 'none'")
         data = _as_frame(X).reset_index(drop=True)
-        eqs = parse_path_model(self.model)
+        self._fit_data = data
+        eqs, covs = parse_path_system(self.model)
         self.equations_ = eqs
+        self.covariances_ = covs
         self.estimators_ = {}
         for eq in eqs:
             self.estimators_[eq.response] = self._estimator_for(eq).fit(data, **fit_params)
@@ -698,8 +740,224 @@ class PathModel(BaseEstimator):
         self.order_ = None if order is None else [eqs[i].response for i in order]
         self.n_features_in_ = data.shape[1]
         self.feature_names_in_ = np.asarray([str(c) for c in data.columns], dtype=object)
+        self._weighted = bool(fit_params.get("sample_weight") is not None)
+
+        self.system_, why, rows = self._build_system(data)
+        same_rows = self.system_ is not None and all(len(r) == len(rows[1]) for r in rows[0].values())
+        needs_ml = bool(covs) or self.order_ is None
+        if self.estimation == "ML" or (self.estimation == "auto" and needs_ml):
+            if self.system_ is None:
+                raise RError("this path model needs the joint maximum likelihood fit (%s), which needs linear "
+                             "equations: %s" % ("residual covariances" if covs else "feedback loops"
+                                                if self.order_ is None else "estimation='ML'", why))
+            theta, ll, conv, _ = self.system_.fit()
+            if not conv:
+                warnings.warn("the maximum likelihood fit of the path model did not converge", RuntimeWarning)
+            self.theta_ = theta
+            self.loglik_ = float(ll)
+            self.estimation_ = "ML"
+            self.converged_ = bool(conv)
+            self._set_coefficients(theta)
+            self.nobs_ = self.system_.n
+        else:
+            if covs:
+                raise RError("residual covariances (~~) need estimation='ML' or 'auto'")
+            self.estimation_ = "OLS"
+            self.converged_ = True
+            self.nobs_ = rows[0]
+            if self.system_ is not None and same_rows:
+                self.theta_ = self._theta_from_estimators()
+                self.loglik_ = float(self.system_.loglik(self.theta_, grad=False))
+            else:
+                self.theta_ = None
+                self.loglik_ = None
+        self._inference()
+        del self._fit_data
         return self
 
+    def _ols_equation(self, eq):
+        from sklearn.linear_model import LinearRegression
+        est = self.estimators_[eq.response]
+        return (isinstance(est, FormulaEstimator) and type(est.estimator_) is LinearRegression
+                and not est.estimator_.fit_intercept)
+
+    def _equation_rows(self, eq, data):
+        env = {} if self.env is None else self.env
+        Ye, Xe = design_matrices(eq.formula, data, contrasts=self.contrasts, na_action=self.na_action, env=env)
+        return np.asarray(Xe.index)
+
+    def _build_system(self, data):
+        """The model as one linear system on the listwise rows: (system, reason, (rows, common))."""
+        from ._parser import Sym, parse
+        from ._pathfit import LinearSystem
+        rows = {}
+        why = None
+        for eq in self.equations_:
+            rows[eq.response] = self._equation_rows(eq, data)
+            if why is None and not self._ols_equation(eq):
+                why = "equation %s is not fitted by least squares" % eq.formula
+            if why is None and not isinstance(parse(eq.lhs), Sym):
+                why = "the response of %s is transformed" % eq.formula
+        if why is None and self._weighted:
+            why = "the fit is weighted"
+        common = None
+        for r in rows.values():
+            common = r if common is None else np.intersect1d(common, r)
+        if common is None:
+            common = np.arange(len(data))
+        if why is not None:
+            return None, why, (rows, common)
+        endo = self.endogenous_
+        sub = data.iloc[common].reset_index(drop=True)
+        try:
+            Y = sub[endo].to_numpy(dtype=float)
+        except (ValueError, TypeError):
+            return None, "an endogenous variable is not numeric", (rows, common)
+        cols, Xs = [], []
+        for eq in self.equations_:
+            est = self.estimators_[eq.response]
+            Xi = est.transform(sub).to_numpy(dtype=float)
+            names = list(est.design_columns_)
+            for v in eq.predictors:
+                if v not in endo:
+                    continue
+                pert = sub.copy()
+                pert[v] = pert[v].astype(float) + 1.0
+                dX = est.transform(pert).to_numpy(dtype=float) - Xi
+                expect = np.zeros_like(dX)
+                if v in names:
+                    expect[:, names.index(v)] = 1.0
+                if v not in names or not np.allclose(dX, expect, atol=1e-8):
+                    return None, "%s does not enter %s as a plain column" % (v, eq.formula), (rows, common)
+            cols.append(names)
+            Xs.append(Xi)
+        return LinearSystem(endo, Y, cols, Xs, self.covariances_), None, (rows, common)
+
+    def _theta_from_estimators(self):
+        s = self.system_
+        theta = np.empty(s.npar)
+        for i, eq in enumerate(self.equations_):
+            sel = np.where((s.pi == i) & (s.kind != "P"))[0]
+            theta[sel] = np.ravel(self.estimators_[eq.response].estimator_.coef_)
+        B, G, _ = s.unpack(np.where(s.kind == "P", 0.0, theta))
+        Z = s.Y @ (np.eye(s.k) - B).T - s.X @ G.T
+        P = np.diag(np.mean(Z ** 2, axis=0))
+        sel = s.kind == "P"
+        theta[sel] = P[s.pi[sel], s.pj[sel]]
+        return theta
+
+    def _set_coefficients(self, theta):
+        s = self.system_
+        for i, eq in enumerate(self.equations_):
+            sel = np.where((s.pi == i) & (s.kind != "P"))[0]
+            inner = self.estimators_[eq.response].estimator_
+            inner.coef_ = np.asarray(theta[sel], dtype=float).reshape(np.shape(inner.coef_))
+
+    # -- inference -------------------------------------------------------------
+    def _inference(self):
+        """The parameter table (lhs, op, rhs, est), its covariance matrix and test kind."""
+        rows, blocks, dfs = [], [], []
+        self._test_ = "t" if self.se == "lm" else "z"
+        if self.se == "lm" and self.estimation_ == "ML":
+            raise RError("se='lm' is for equation-by-equation estimation; use 'expected' or 'observed'")
+        if self.theta_ is not None and self.se in ("expected", "observed"):
+            s = self.system_
+            V = s.vcov(self.theta_, self.se)
+            self._params_ = pd.DataFrame(s.names(), columns=["lhs", "op", "rhs"])
+            self._params_["est"] = self.theta_
+            self._vcov_ = V
+            self._df_ = np.full(s.npar, np.inf)
+            self.information_ = self.se
+            return
+        self.information_ = {"lm": "lm", "none": "none"}.get(self.se, "observed (per equation)")
+        # equation by equation
+        psi = []
+        for eq in self.equations_:
+            est = self.estimators_[eq.response]
+            names, coef, V, df, sig2 = self._equation_inference(eq, est)
+            for c in names:
+                rows.append((eq.response, "~1", "") if c == "(Intercept)" else (eq.response, "~", c))
+            blocks.append((coef, V))
+            dfs.extend([df] * len(names))
+            psi.append(sig2)
+        for eq, (sig2, n) in zip(self.equations_, psi):
+            rows.append((eq.response, "~~", eq.response))
+            se2 = 2.0 * sig2 ** 2 / n if (n and self.se in ("expected", "observed")) else np.nan
+            blocks.append((np.array([sig2]), np.array([[se2]])))
+            dfs.append(np.inf)
+        est = np.concatenate([b[0] for b in blocks]) if blocks else np.zeros(0)
+        m = len(est)
+        V = np.zeros((m, m))
+        o = 0
+        for b, Vb in blocks:
+            V[o:o + len(b), o:o + len(b)] = Vb
+            o += len(b)
+        self._params_ = pd.DataFrame(rows, columns=["lhs", "op", "rhs"])
+        self._params_["est"] = est
+        self._vcov_ = V if self.se != "none" else np.full((m, m), np.nan)
+        self._df_ = np.asarray(dfs, dtype=float)
+
+    def _equation_inference(self, eq, est):
+        """names, coef, covariance, df, (sigma2_ML, n) of one equation fitted on its own."""
+        if isinstance(est, GAMRegressor):
+            names = list(est.design_columns_)
+            ft = est.fits_[0]
+            return names, np.asarray(ft.coef, dtype=float), ft.Vp, np.inf, (float(ft.scale), 0)
+        inner = est.estimator_
+        names = list(est.design_columns_)
+        coef = np.ravel(getattr(inner, "coef_", np.full(len(names), np.nan))).astype(float)
+        if len(coef) != len(names):
+            coef = np.full(len(names), np.nan)
+        if not self._ols_equation(eq) or self._weighted:
+            return names, coef, np.full((len(names), len(names)), np.nan), np.inf, (np.nan, 0)
+        env = {} if self.env is None else self.env
+        data = self._fit_data
+        Ye, Xe = design_matrices(eq.formula, data, contrasts=self.contrasts, na_action=self.na_action, env=env)
+        Xm = Xe.to_numpy(dtype=float)
+        yv = Ye.iloc[:, 0].to_numpy(dtype=float)
+        n, p = Xm.shape
+        rss = float(np.sum((yv - Xm @ coef) ** 2))
+        XtXi = np.linalg.pinv(Xm.T @ Xm)
+        if self.se == "lm":
+            return names, coef, rss / (n - p) * XtXi, float(n - p), (rss / n, n)
+        return names, coef, rss / n * XtXi, np.inf, (rss / n, n)
+
+    def _table(self, est, se, df):
+        from scipy import stats
+        with np.errstate(divide="ignore", invalid="ignore"):
+            stat = est / se
+        stat = np.where(se > 0, stat, np.nan)
+        dist_sf = np.where(np.isinf(df), stats.norm.sf(np.abs(stat)), stats.t.sf(np.abs(stat), np.where(np.isinf(df), 1, df)))
+        a = (1 - self.level) / 2
+        q = np.where(np.isinf(df), stats.norm.ppf(1 - a), stats.t.ppf(1 - a, np.where(np.isinf(df), 1, df)))
+        return {"se": se, self._test_: stat, "pvalue": 2 * dist_sf, "ci.lower": est - q * se, "ci.upper": est + q * se}
+
+    def coefficients(self) -> pd.DataFrame:
+        """Parameter estimates like ``lavaan::parameterEstimates()``: ``lhs``, ``op``
+        (``"~"`` regression, ``"~1"`` intercept, ``"~~"`` residual (co)variance),
+        ``rhs``, ``est``, ``se``, ``z`` (``t`` with ``se="lm"``), ``pvalue``,
+        ``ci.lower``, ``ci.upper``."""
+        check_is_fitted(self, "estimators_")
+        out = self._params_.copy()
+        se = np.sqrt(np.maximum(np.diag(self._vcov_), 0.0)) if len(out) else np.zeros(0)
+        se = np.where(np.isnan(np.diag(self._vcov_)), np.nan, se) if len(out) else se
+        for k, v in self._table(out["est"].to_numpy(dtype=float), se, self._df_).items():
+            out[k] = v
+        return out.iloc[self._lavaan_order()].reset_index(drop=True)
+
+    def _lavaan_order(self):
+        rank = self._params_["op"].map({"~": 0, "~~": 1, "~1": 2}).to_numpy()
+        return np.argsort(rank, kind="stable")
+
+    def vcov(self) -> pd.DataFrame:
+        """Covariance matrix of the estimates (rows/columns as in :meth:`coefficients`)."""
+        check_is_fitted(self, "estimators_")
+        o = self._lavaan_order()
+        P = self._params_.iloc[o]
+        lab = ["%s%s%s" % (a, b, c) for a, b, c in P[["lhs", "op", "rhs"]].itertuples(index=False)]
+        return pd.DataFrame(self._vcov_[np.ix_(o, o)], index=lab, columns=lab)
+
+    # -- prediction ---------------------------------------------------------------
     def predict(self, X) -> pd.DataFrame:
         """Predictions of every endogenous variable (one column per equation)."""
         from ._parser import Sym, all_vars, parse
@@ -709,10 +967,20 @@ class PathModel(BaseEstimator):
         if self.predict_mode == "direct":
             for eq in self.equations_:
                 out[eq.response] = np.asarray(self.estimators_[eq.response].predict(data)).ravel()
-        else:
-            if self.order_ is None:
-                raise RError("the path model is non-recursive (it has feedback loops); "
+        elif self.order_ is None:
+            if self.system_ is None:
+                raise RError("the path model is non-recursive (it has feedback loops) and not linear; "
                              "use predict_mode='direct'")
+            # reduced form: y = (I - B)^-1 (G x)
+            zero = data.copy()
+            for v in self.endogenous_:
+                zero[v] = 0.0
+            C = np.column_stack([np.asarray(self.estimators_[r].predict(zero), dtype=float).ravel()
+                                 for r in self.endogenous_])
+            B = self._linear_B()
+            Yp = np.linalg.solve(np.eye(len(self.endogenous_)) - B, C.T).T
+            out = {r: Yp[:, i] for i, r in enumerate(self.endogenous_)}
+        else:
             data = data.copy()
             plain = {eq.response: isinstance(parse(eq.lhs), Sym) for eq in self.equations_}
             transformed = {v: eq.lhs for eq in self.equations_ if not plain[eq.response]
@@ -768,29 +1036,38 @@ class PathModel(BaseEstimator):
             coefs[eq.response] = d
         return coefs
 
-    def coefficients(self) -> pd.DataFrame:
-        """Coefficients in long form: ``lhs``, ``op`` (``"~"`` or ``"~1"``), ``rhs``, ``est``
-        (like the regression rows of ``lavaan::parameterEstimates()``)."""
-        check_is_fitted(self, "estimators_")
-        rows = []
-        for resp, d in self._linear_coefs().items():
+    def _linear_B(self):
+        endo = self.endogenous_
+        B = np.zeros((len(endo), len(endo)))
+        for i, (resp, d) in enumerate(self._linear_coefs().items()):
             for c, b in d.items():
-                rows.append((resp, "~1", "", b) if c == "(Intercept)" else (resp, "~", c, b))
-        return pd.DataFrame(rows, columns=["lhs", "op", "rhs", "est"])
+                if c in endo:
+                    B[i, endo.index(c)] += b
+        return B
 
-    def effects(self, kind: str = "total") -> pd.DataFrame:
-        """Direct, indirect or total effects (rows: endogenous, columns: all predictors).
+    def _effect_columns(self):
+        endo = self.endogenous_
+        return list(endo) + [v for v in self.exogenous_ if v not in endo]
+
+    def effects(self, kind: str = "total", se: bool = False) -> pd.DataFrame:
+        """Direct, indirect or total effects.
 
         Needs linear equations whose design columns are the variables themselves
         (``y ~ m + x``); then with ``B`` the direct effects, total effects are
-        ``(I - B_yy)^-1 B`` and indirect = total - direct, as in lavaan."""
+        ``(I - B_yy)^-1 B`` and indirect = total - direct, as in lavaan.  Returns
+        a matrix (rows: endogenous, columns: all variables), or with ``se=True``
+        a long table (``lhs`` effect on, ``rhs`` cause, ``est``, ``se``, ``z``,
+        ``pvalue``, ``ci.lower``, ``ci.upper``) of the effects the model allows,
+        with delta-method standard errors (lavaan's ``:=``)."""
         check_is_fitted(self, "estimators_")
         if kind not in ("total", "direct", "indirect"):
             raise ValueError("kind must be 'total', 'direct' or 'indirect'")
         coefs = self._linear_coefs()
         endo = self.endogenous_
-        cols = list(endo) + [v for v in self.exogenous_ if v not in endo]
-        D = np.zeros((len(endo), len(cols)))
+        cols = self._effect_columns()
+        ne = len(endo)
+        D = np.zeros((ne, len(cols)))
+        mask = np.zeros_like(D, dtype=bool)
         for i, resp in enumerate(endo):
             for c, b in coefs[resp].items():
                 if c == "(Intercept)":
@@ -799,10 +1076,45 @@ class PathModel(BaseEstimator):
                     raise RError("effects() needs every design column to be a variable of the model; "
                                  "%r (equation for %s) is not" % (c, resp))
                 D[i, cols.index(c)] = b
-        if kind == "direct":
-            M = D
-        else:
-            Byy = D[:, :len(endo)]
-            T = np.linalg.solve(np.eye(len(endo)) - Byy, D)
-            M = T if kind == "total" else T - D
-        return pd.DataFrame(M, index=endo, columns=cols)
+                mask[i, cols.index(c)] = True
+        Ainv = np.linalg.inv(np.eye(ne) - D[:, :ne])
+        T = Ainv @ D
+        M = {"direct": D, "total": T, "indirect": T - D}[kind]
+        if not se:
+            return pd.DataFrame(M, index=endo, columns=cols)
+        # structure: which effects exist
+        Bm = mask[:, :ne].astype(int)
+        reach = Bm.copy()  # reach[r, i]: a path i -> ... -> r of length >= 1
+        for _ in range(ne):
+            reach = ((reach + reach @ Bm) > 0).astype(int)
+        indirect_mask = (reach @ mask.astype(int)) > 0
+        smask = {"direct": mask, "indirect": indirect_mask, "total": mask | indirect_mask}[kind]
+        # delta method over the regression coefficients (rows "~" of the parameter table)
+        P = self._params_
+        reg = np.where(P["op"].to_numpy() == "~")[0]
+        Ext = np.eye(len(cols))
+        Ext[:ne] += T
+        J = np.zeros((ne, len(cols), len(reg)))
+        for q, pidx in enumerate(reg):
+            i, k = endo.index(P["lhs"].iloc[pidx]), cols.index(P["rhs"].iloc[pidx])
+            dT = np.outer(Ainv[:, i], Ext[k])
+            if kind == "direct":
+                dT = np.zeros_like(dT)
+                dT[i, k] = 1.0
+            elif kind == "indirect":
+                dT[i, k] -= 1.0
+            J[:, :, q] = dT
+        V = self._vcov_[np.ix_(reg, reg)]
+        r_idx, c_idx = np.where(smask)
+        Jr = J[r_idx, c_idx]
+        var = np.einsum("ij,jk,ik->i", Jr, V, Jr)
+        est = M[r_idx, c_idx]
+        sev = np.sqrt(np.maximum(var, 0.0))
+        out = pd.DataFrame({"lhs": [endo[r] for r in r_idx], "rhs": [cols[c] for c in c_idx], "est": est})
+        test, self._test_ = self._test_, "z"
+        try:
+            for k, v in self._table(est, sev, np.full(len(est), np.inf)).items():
+                out[k] = v
+        finally:
+            self._test_ = test
+        return out

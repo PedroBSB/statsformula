@@ -17,7 +17,7 @@ from sklearn.linear_model import Ridge  # noqa: E402
 from sklearn.model_selection import GridSearchCV  # noqa: E402
 
 import statsformula as sf  # noqa: E402
-from statsformula._path import parse_path_model, path_order, split_statements  # noqa: E402
+from statsformula._path import parse_path_model, parse_path_system, path_order, split_statements  # noqa: E402
 from statsformula.sklearn import GAMRegressor, PathModel  # noqa: E402
 
 import path_cases  # noqa: E402
@@ -89,6 +89,11 @@ def test_parse_path_model():
     for bad in ["f =~ x1 + x2", "y ~~ x", "ab := a*b", "a > 0", "~ x", ""]:
         with pytest.raises(sf.RError):
             parse_path_model(bad)
+    eqs, covs = parse_path_system("y1 ~ x\ny2 ~ x\ny3 ~ y1\ny1 ~~ y2 + y3\ny2 ~~ y2")
+    assert [e.response for e in eqs] == ["y1", "y2", "y3"] and covs == [("y1", "y2"), ("y1", "y3")]
+    for bad in ["y1 ~ x\ny1 ~~ x", "y1 ~ x\ny1 ~~ log(y2)", "y1 ~ x\ny1 + y2 ~~ y3"]:
+        with pytest.raises(sf.RError):
+            parse_path_system(bad)
 
 
 def test_effects_and_modes():
@@ -102,12 +107,17 @@ def test_effects_and_modes():
     pd_ = PathModel("m ~ x + z\ny ~ m + x", predict_mode="direct").fit(D)
     np.testing.assert_allclose(pd_.predict(D)["y"], pm.estimators_["y"].predict(D))
     assert pd_.score(D) > pm.score(D)
-    # non-recursive: fit and direct prediction work, propagation refuses
+    # non-recursive: full-information ML, propagation through the reduced form
     nr = PathModel("m ~ y + x\ny ~ m + z").fit(D)
-    assert nr.order_ is None
-    with pytest.raises(sf.RError, match="non-recursive"):
-        nr.predict(D)
+    assert nr.order_ is None and nr.estimation_ == "ML" and nr.converged_
+    assert np.isfinite(nr.predict(D).to_numpy()).all()
     assert PathModel("m ~ y + x\ny ~ m + z", predict_mode="direct").fit(D).predict(D).shape == (len(D), 2)
+    # ... unless an equation is not linear in the endogenous variables
+    with pytest.raises(sf.RError, match="feedback loops"):
+        PathModel("m ~ exp(y / 5) + x\ny ~ m + z").fit(D)
+    nl = PathModel("m ~ exp(y / 5) + x\ny ~ m + z", estimation="OLS").fit(D)
+    with pytest.raises(sf.RError, match="non-recursive"):
+        nl.predict(D)
     # propagation through a transformed response is refused
     with pytest.raises(sf.RError, match="transformed response"):
         PathModel("log(w) ~ x\ny ~ w + x").fit(D).predict(D)
